@@ -5,7 +5,7 @@ A Container Storage Interface (CSI) driver for [TrueNAS SCALE](https://www.truen
 ## Features
 
 - **NFS volumes** - ReadWriteMany (RWX) access mode for shared storage
-- **iSCSI volumes** - ReadWriteOnce (RWO) access mode for block storage
+- **iSCSI volumes** - Block storage with ReadWriteOnce (RWO) and ReadWriteMany (RWX) access modes (RWX requires cluster filesystem like GFS2/OCFS2)
 - **Dynamic provisioning** - Automatic volume creation and deletion
 - **Volume expansion** - Online resize of volumes
 - **Snapshots and clones** - CSI snapshot support for backup and cloning

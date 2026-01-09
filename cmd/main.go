@@ -10,7 +10,6 @@ import (
 	"syscall"
 
 	"github.com/truenas/truenas-csi/pkg/driver"
-	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
 )
 
@@ -21,30 +20,33 @@ var (
 )
 
 func main() {
-	klog.InitFlags(nil)
+	logConfig := textlogger.NewConfig()
+	logConfig.AddFlags(flag.CommandLine)
 	flag.Parse()
 
-	klog.V(driver.LogLevelInfo).InfoS("Starting TrueNAS CSI Driver", "version", driver.DRIVER_VERSION)
+	logger := textlogger.NewLogger(logConfig)
+
+	logger.V(driver.LogLevelInfo).Info("Starting TrueNAS CSI Driver", "version", driver.DRIVER_VERSION)
 
 	if err := validateFlags(); err != nil {
-		klog.ErrorS(err, "Invalid configuration")
+		logger.Error(err, "Invalid configuration")
 		os.Exit(1)
 	}
 
 	config := &driver.DriverConfig{
 		NodeID:   *nodeID,
 		Endpoint: *endpoint,
-		Logger:   textlogger.NewLogger(textlogger.NewConfig()),
+		Logger:   logger,
 	}
 
 	if err := loadEnvConfig(config); err != nil {
-		klog.ErrorS(err, "Invalid configuration")
+		logger.Error(err, "Invalid configuration")
 		os.Exit(1)
 	}
 
 	d, err := driver.NewDriver(config)
 	if err != nil {
-		klog.ErrorS(err, "Failed to create driver")
+		logger.Error(err, "Failed to create driver")
 		os.Exit(1)
 	}
 
@@ -59,15 +61,15 @@ func main() {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			klog.ErrorS(err, "Driver failed")
+			logger.Error(err, "Driver failed")
 			os.Exit(1)
 		}
 	case sig := <-sigCh:
-		klog.InfoS("Received signal, shutting down", "signal", sig)
+		logger.Info("Received signal, shutting down", "signal", sig)
 		d.Stop()
 	}
 
-	klog.InfoS("TrueNAS CSI Driver stopped")
+	logger.Info("TrueNAS CSI Driver stopped")
 }
 
 func validateFlags() error {
