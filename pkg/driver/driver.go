@@ -14,7 +14,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-logr/logr"
-	"github.com/iXsystems/truenas_k8_driver/pkg/client"
+	"github.com/truenas/truenas-csi/pkg/client"
 	"google.golang.org/grpc"
 	"k8s.io/mount-utils"
 )

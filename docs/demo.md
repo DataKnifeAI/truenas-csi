@@ -284,5 +284,5 @@ For production use on a real Kubernetes cluster:
    ```
 
 ## Getting Help
-- **Report issues**: https://github.com/iXsystems/truenas_k8_driver/issues
+- **Report issues**: https://github.com/truenas/truenas-csi/issues
 

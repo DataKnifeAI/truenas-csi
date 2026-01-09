@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iXsystems/truenas_k8_driver/pkg/driver"
+	"github.com/truenas/truenas-csi/pkg/driver"
 	sanity "github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	"k8s.io/klog/v2/textlogger"
 )

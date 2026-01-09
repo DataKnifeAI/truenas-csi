@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/iXsystems/truenas_k8_driver/pkg/client"
+	"github.com/truenas/truenas-csi/pkg/client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"

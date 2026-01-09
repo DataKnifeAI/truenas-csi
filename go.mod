@@ -1,10 +1,11 @@
-module github.com/iXsystems/truenas_k8_driver
+module github.com/truenas/truenas-csi
 
 go 1.24.5
 
 require (
 	github.com/coder/websocket v1.8.12
 	github.com/container-storage-interface/spec v1.12.0
+	github.com/go-logr/logr v1.4.3
 	github.com/kubernetes-csi/csi-lib-iscsi v0.0.0-20240130114156-dd26709d0dcc
 	github.com/kubernetes-csi/csi-test/v5 v5.4.0
 	google.golang.org/grpc v1.76.0
@@ -15,7 +16,6 @@ require (
 )
 
 require (
-	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/golang/mock v1.6.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect

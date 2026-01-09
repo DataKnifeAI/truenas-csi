@@ -188,8 +188,8 @@ For an interactive demonstration of all driver features using a local Kind clust
 
 ## Contributing
 
-- Report issues: https://github.com/iXsystems/truenas_k8_driver/issues
-- Submit pull requests: https://github.com/iXsystems/truenas_k8_driver/pulls
+- Report issues: https://github.com/truenas/truenas-csi/issues
+- Submit pull requests: https://github.com/truenas/truenas-csi/pulls
 
 ## License
 

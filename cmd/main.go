@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/iXsystems/truenas_k8_driver/pkg/driver"
+	"github.com/truenas/truenas-csi/pkg/driver"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
 )
