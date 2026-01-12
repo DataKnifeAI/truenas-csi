@@ -338,17 +338,15 @@ type ISCSIPortalListen struct {
 
 // ISCSIInitiator represents an iSCSI initiator configuration in TrueNAS.
 type ISCSIInitiator struct {
-	ID          int      `json:"id"`
-	Initiators  []string `json:"initiators"`
-	AuthNetwork []string `json:"auth_network,omitempty"`
-	Comment     string   `json:"comment,omitempty"`
+	ID         int      `json:"id"`
+	Initiators []string `json:"initiators"`
+	Comment    string   `json:"comment,omitempty"`
 }
 
 // ISCSIInitiatorCreateOptions specifies options for creating an iSCSI initiator group.
 type ISCSIInitiatorCreateOptions struct {
-	Initiators  []string `json:"initiators,omitempty"`   // List of initiator IQNs or patterns
-	AuthNetwork []string `json:"auth_network,omitempty"` // List of allowed network CIDRs
-	Comment     string   `json:"comment,omitempty"`
+	Initiators []string `json:"initiators,omitempty"` // List of initiator IQNs or patterns
+	Comment    string   `json:"comment,omitempty"`
 }
 
 // Snapshot represents a ZFS snapshot in TrueNAS.
