@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"slices"
 	"strings"
 	"time"
@@ -14,9 +13,7 @@ import (
 	"k8s.io/mount-utils"
 )
 
-// Mount timeout constant (aligned with official csi-driver-nfs)
 const (
-	// defaultMountTimeout is the default timeout for mount operations (matches csi-driver-nfs)
 	defaultMountTimeout = 110 * time.Second
 )
 
@@ -48,7 +45,7 @@ func NewNFSHandler(mounter mount.Interface, log logr.Logger) *NFSHandler {
 
 // Protocol returns the protocol name
 func (h *NFSHandler) Protocol() string {
-	return "nfs"
+	return ProtocolNFS
 }
 
 // parseNFSConfig extracts NFS configuration from publish and volume contexts
@@ -100,31 +97,29 @@ func getMountOptions(config *NFSConfig, readonly bool) []string {
 	return options
 }
 
-// mountWithTimeout executes mount with a timeout. Uses exec.CommandContext to ensure
-// the mount process is killed if the timeout is reached (no goroutine leak).
+// mountWithTimeout executes mount with a timeout
 func (h *NFSHandler) mountWithTimeout(ctx context.Context, source, target, fsType string, options []string) error {
-	// Create a context with timeout
 	mountCtx, cancel := context.WithTimeout(ctx, defaultMountTimeout)
 	defer cancel()
 
-	// Build mount command arguments
-	args := []string{"-t", fsType}
-	if len(options) > 0 {
-		args = append(args, "-o", strings.Join(options, ","))
-	}
-	args = append(args, source, target)
+	h.log.V(LogLevelDebug).Info("Executing mount command", "source", source, "target", target, "fsType", fsType, "options", options, "timeout", defaultMountTimeout)
 
-	h.log.V(LogLevelDebug).Info("Executing mount command", "args", args, "timeout", defaultMountTimeout)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.mounter.Mount(source, target, fsType, options)
+	}()
 
-	// exec.CommandContext kills the process when context is cancelled/times out
-	cmd := exec.CommandContext(mountCtx, "mount", args...)
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
+	select {
+	case <-mountCtx.Done():
 		if mountCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("mount timed out after %v", defaultMountTimeout)
 		}
-		return fmt.Errorf("mount failed: %v, output: %s", err, strings.TrimSpace(string(output)))
+		return mountCtx.Err()
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("mount failed: %w", err)
+		}
+
 	}
 
 	return nil

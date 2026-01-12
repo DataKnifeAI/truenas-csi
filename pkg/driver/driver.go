@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -57,10 +58,10 @@ const (
 	DefaultLUN            = 0
 
 	// IQN validation
-	iqnMinParts       = 3       // iqn.YYYY-MM.domain
-	iqnDateFieldLen   = 7       // YYYY-MM
-	iqnDateSeparator  = 4       // position of '-' in YYYY-MM
-	volumeIDSeparator = "/"     // separator in volume IDs (pool/name)
+	iqnMinParts       = 3   // iqn.YYYY-MM.domain
+	iqnDateFieldLen   = 7   // YYYY-MM
+	iqnDateSeparator  = 4   // position of '-' in YYYY-MM
+	volumeIDSeparator = "/" // separator in volume IDs (pool/name)
 
 	// Publish context keys (used in ControllerPublishVolume -> NodeStageVolume)
 	PublishContextProtocol     = "protocol"
@@ -450,8 +451,10 @@ func (d *Driver) Stop() {
 
 type requestIDKey struct{}
 
+var requestCounter atomic.Uint64
+
 func generateRequestID() string {
-	return fmt.Sprintf("%d-%04x", time.Now().UnixNano()%1000000, time.Now().Nanosecond()&0xFFFF)
+	return fmt.Sprintf("%d", requestCounter.Add(1))
 }
 
 func (d *Driver) unaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -485,13 +488,13 @@ func sanitizeRequest(req any) any {
 		}
 		// Return a safe copy without potentially sensitive parameters
 		safe := &struct {
-			Name                string
-			CapacityRange       *csi.CapacityRange
-			VolumeCapabilities  int
-			ParameterKeys       []string
-			HasSecrets          bool
-			HasVolumeSource     bool
-			AccessibilityReqs   bool
+			Name               string
+			CapacityRange      *csi.CapacityRange
+			VolumeCapabilities int
+			ParameterKeys      []string
+			HasSecrets         bool
+			HasVolumeSource    bool
+			AccessibilityReqs  bool
 		}{
 			Name:               r.Name,
 			CapacityRange:      r.CapacityRange,

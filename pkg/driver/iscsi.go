@@ -53,20 +53,22 @@ type ISCSIConfig struct {
 }
 
 // NewISCSIHandler creates a new iSCSI protocol handler
-func NewISCSIHandler(mounter *mount.SafeFormatAndMount, log logr.Logger) *ISCSIHandler {
+func NewISCSIHandler(mounter *mount.SafeFormatAndMount, log logr.Logger) (*ISCSIHandler, error) {
 	// Ensure connector directory exists
-	os.MkdirAll(connectorDir, 0750)
+	if err := os.MkdirAll(connectorDir, 0o750); err != nil {
+		return nil, fmt.Errorf("failed to create connector directory %s: %w", connectorDir, err)
+	}
 
 	return &ISCSIHandler{
 		mounter: mounter,
 		resizer: mount.NewResizeFs(mounter.Exec),
 		log:     log,
-	}
+	}, nil
 }
 
 // Protocol returns the protocol name
 func (h *ISCSIHandler) Protocol() string {
-	return "iscsi"
+	return ProtocolISCSI
 }
 
 // connectorPath returns the path for storing connector info for a volume
@@ -182,7 +184,7 @@ func (h *ISCSIHandler) Stage(ctx context.Context, req *StageRequest) (*StageResu
 	}
 
 	// Create staging directory
-	if err := os.MkdirAll(req.StagingPath, 0750); err != nil {
+	if err := os.MkdirAll(req.StagingPath, 0o750); err != nil {
 		return nil, fmt.Errorf("failed to create staging directory: %w", err)
 	}
 
@@ -292,7 +294,7 @@ func (h *ISCSIHandler) Publish(ctx context.Context, req *PublishRequest) error {
 	}
 
 	// Create target directory
-	if err := os.MkdirAll(req.TargetPath, 0750); err != nil {
+	if err := os.MkdirAll(req.TargetPath, 0o750); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
@@ -342,12 +344,12 @@ func (h *ISCSIHandler) publishBlockVolume(ctx context.Context, req *PublishReque
 
 	// Create parent directory of target path
 	targetDir := filepath.Dir(req.TargetPath)
-	if err := os.MkdirAll(targetDir, 0750); err != nil {
+	if err := os.MkdirAll(targetDir, 0o750); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
 	// Create target file for block device mount
-	file, err := os.OpenFile(req.TargetPath, os.O_CREATE|os.O_RDWR, 0660)
+	file, err := os.OpenFile(req.TargetPath, os.O_CREATE|os.O_RDWR, 0o660)
 	if err != nil {
 		return fmt.Errorf("failed to create target file: %w", err)
 	}
@@ -429,7 +431,7 @@ func (h *ISCSIHandler) Expand(ctx context.Context, req *ExpandRequest) (*ExpandR
 		devicePath = fmt.Sprintf("/dev/%s", connector.Devices[0].Name)
 		// Rescan this device specifically
 		rescanPath := fmt.Sprintf("/sys/block/%s/device/rescan", connector.Devices[0].Name)
-		if err := os.WriteFile(rescanPath, []byte("1\n"), 0200); err != nil {
+		if err := os.WriteFile(rescanPath, []byte("1\n"), 0o200); err != nil {
 			h.log.V(LogLevelTrace).Info("Failed to rescan device", "error", err)
 		}
 	}
@@ -460,7 +462,7 @@ func (h *ISCSIHandler) rescanSCSIHosts() {
 
 	for _, entry := range entries {
 		scanPath := filepath.Join(hostDir, entry.Name(), "scan")
-		if err := os.WriteFile(scanPath, []byte("- - -"), 0200); err != nil {
+		if err := os.WriteFile(scanPath, []byte("- - -"), 0o200); err != nil {
 			h.log.V(LogLevelTrace).Info("Failed to scan SCSI host", "host", entry.Name(), "error", err)
 		}
 	}
