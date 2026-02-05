@@ -12,6 +12,14 @@ The TrueNAS CSI Operator automates the deployment and lifecycle management of th
 - Configuration management via ConfigMaps
 - Status monitoring and reporting
 
+## Supported Versions
+
+| Component | Minimum Version |
+|-----------|-----------------|
+| OpenShift | 4.20+ |
+| Kubernetes | 1.26+ |
+| TrueNAS SCALE | 25.10.0+ |
+
 ## Prerequisites
 
 - Go 1.22+

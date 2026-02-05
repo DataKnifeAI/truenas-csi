@@ -12,10 +12,18 @@ Red Hat OpenShift certification involves three levels:
 
 All three must be completed for full CSI certification.
 
+## Supported Versions
+
+| Component | Minimum Version |
+|-----------|-----------------|
+| OpenShift | 4.20+ |
+| Kubernetes | 1.26+ |
+| TrueNAS SCALE | 25.10.0+ |
+
 ## Prerequisites
 
 - Red Hat Partner Connect account: https://connect.redhat.com
-- OpenShift cluster (4.17+) for testing
+- OpenShift cluster (4.20+) for testing
 - TrueNAS SCALE 25.10.0+ for integration testing
 - Tools installed:
   - `preflight` - Container certification tool

@@ -213,7 +213,7 @@ For an interactive demonstration of all driver features using a local Kind clust
 
 ## OpenShift
 
-The TrueNAS CSI Driver is certified for Red Hat OpenShift and available via OperatorHub.
+The TrueNAS CSI Driver supports Red Hat OpenShift 4.20+ and is designed for OperatorHub distribution.
 
 ### Quick Start (OpenShift)
 
