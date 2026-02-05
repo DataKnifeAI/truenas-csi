@@ -22,7 +22,7 @@ import (
 
 const (
 	DRIVER_NAME    = "csi.truenas.io"
-	DRIVER_VERSION = "1.0.0"
+	DRIVER_VERSION = "0.1.0"
 
 	DEFAULT_IQN_BASE = "iqn.2000-01.io.truenas"
 
@@ -207,11 +207,26 @@ type Driver struct {
 	volumeCaps     []*csi.VolumeCapability_AccessMode
 }
 
+// DriverMode represents the operating mode of the CSI driver
+type DriverMode string
+
+const (
+	// DriverModeController runs only the controller service (provisioning, attach/detach)
+	DriverModeController DriverMode = "controller"
+	// DriverModeNode runs only the node service (stage/unstage, mount/unmount)
+	DriverModeNode DriverMode = "node"
+	// DriverModeAll runs both controller and node services (default, for testing)
+	DriverModeAll DriverMode = "all"
+)
+
 type DriverConfig struct {
 	DriverName    string
 	DriverVersion string
 	NodeID        string
 	Endpoint      string
+
+	// Mode determines which services to run: "controller", "node", or "all"
+	Mode DriverMode
 
 	TrueNASURL      string
 	TrueNASAPIKey   string
@@ -315,6 +330,14 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 	}
 	log.V(LogLevelInfo).Info("Pool validated successfully", "pool", config.DefaultPool, "guid", pool.GUID)
 
+	// Default to "all" mode if not specified
+	mode := config.Mode
+	if mode == "" {
+		mode = DriverModeAll
+	}
+
+	log.V(LogLevelInfo).Info("Initializing driver", "mode", mode)
+
 	d := &Driver{
 		name:         config.DriverName,
 		version:      config.DriverVersion,
@@ -330,20 +353,29 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 
 	d.initializeCapabilities()
 
+	// Identity server is always created
 	d.identityServer = NewIdentityServer(d)
-	d.controllerServer = NewControllerServer(d)
 
-	// Create node server (handlers are created internally)
-	mounter := mount.New("")
-	nodeServer, err := NewNodeServer(&NodeServerConfig{
-		Driver:  d,
-		Mounter: mounter,
-	})
-	if err != nil {
-		truenasClient.Close()
-		return nil, fmt.Errorf("failed to create node server: %w", err)
+	// Create controller server only in controller or all mode
+	if mode == DriverModeController || mode == DriverModeAll {
+		log.V(LogLevelInfo).Info("Creating controller server")
+		d.controllerServer = NewControllerServer(d)
 	}
-	d.nodeServer = nodeServer
+
+	// Create node server only in node or all mode
+	if mode == DriverModeNode || mode == DriverModeAll {
+		log.V(LogLevelInfo).Info("Creating node server")
+		mounter := mount.New("")
+		nodeServer, err := NewNodeServer(&NodeServerConfig{
+			Driver:  d,
+			Mounter: mounter,
+		})
+		if err != nil {
+			truenasClient.Close()
+			return nil, fmt.Errorf("failed to create node server: %w", err)
+		}
+		d.nodeServer = nodeServer
+	}
 
 	return d, nil
 }

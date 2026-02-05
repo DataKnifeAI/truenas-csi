@@ -17,6 +17,7 @@ var (
 	// CSI protocol flags
 	endpoint = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
 	nodeID   = flag.String("node-id", "", "Node ID")
+	mode     = flag.String("mode", "all", "Driver mode: controller, node, or all")
 )
 
 func main() {
@@ -36,6 +37,7 @@ func main() {
 	config := &driver.DriverConfig{
 		NodeID:   *nodeID,
 		Endpoint: *endpoint,
+		Mode:     driver.DriverMode(*mode),
 		Logger:   logger,
 	}
 
@@ -83,6 +85,14 @@ func validateFlags() error {
 
 	if *endpoint == "" {
 		return fmt.Errorf("--endpoint is required")
+	}
+
+	// Validate mode
+	switch driver.DriverMode(*mode) {
+	case driver.DriverModeController, driver.DriverModeNode, driver.DriverModeAll:
+		// valid
+	default:
+		return fmt.Errorf("--mode must be one of: controller, node, all")
 	}
 
 	return nil

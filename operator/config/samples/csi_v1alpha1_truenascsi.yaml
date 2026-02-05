@@ -1,0 +1,28 @@
+apiVersion: csi.truenas.io/v1alpha1
+kind: TrueNASCSI
+metadata:
+  name: truenas
+spec:
+  # Required: TrueNAS WebSocket API URL
+  truenasURL: "wss://truenas.example.com/api/current"
+
+  # Required: Name of Secret containing TrueNAS API key
+  credentialsSecret: "truenas-api-credentials"
+
+  # Required: Default ZFS pool for volume provisioning
+  defaultPool: "tank"
+
+  # Optional: NFS server address (required for NFS volumes)
+  nfsServer: "192.168.1.100"
+
+  # Optional: iSCSI portal address (required for iSCSI volumes)
+  iscsiPortal: "192.168.1.100:3260"
+
+  # Optional: Skip TLS verification (default: false)
+  insecureSkipTLS: false
+
+  # Optional: Custom driver image
+  # driverImage: "quay.io/truenas_solutions/truenas-csi:latest"
+
+  # Optional: Number of controller replicas (default: 1)
+  # controllerReplicas: 1

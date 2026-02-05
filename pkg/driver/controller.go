@@ -504,16 +504,10 @@ func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, data
 	// Create initiator group if specified
 	var initiatorID int
 	initiators := parameters["iscsi.initiators"]
-	networks := parameters["iscsi.networks"]
-	if initiators != "" || networks != "" {
+	if initiators != "" {
 		initOpts := &client.ISCSIInitiatorCreateOptions{
-			Comment: fmt.Sprintf("CSI volume %s", volumeID),
-		}
-		if initiators != "" {
-			initOpts.Initiators = strings.Split(initiators, ",")
-		}
-		if networks != "" {
-			initOpts.AuthNetwork = strings.Split(networks, ",")
+			Initiators: strings.Split(initiators, ","),
+			Comment:    fmt.Sprintf("CSI volume %s", volumeID),
 		}
 
 		init, err := s.driver.Client().CreateISCSIInitiator(ctx, initOpts)
@@ -526,7 +520,7 @@ func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, data
 			return nil, fmt.Errorf("failed to create initiator group: %w", err)
 		}
 		initiatorID = init.ID
-		s.driver.Log().V(LogLevelDebug).Info("Created initiator group for iSCSI target", "initiatorId", initiatorID, "initiators", initiators, "networks", networks)
+		s.driver.Log().V(LogLevelDebug).Info("Created initiator group for iSCSI target", "initiatorId", initiatorID, "initiators", initiators)
 	}
 
 	iqnBase := s.driver.GetISCSIIQNBaseFromParameters(parameters)

@@ -1,0 +1,91 @@
+# UBI-based Dockerfile for Red Hat OpenShift certification
+# Multi-stage build: CentOS for packages, UBI for certified base
+
+# Stage 1: Build the Go binary
+FROM registry.access.redhat.com/ubi10/go-toolset:latest AS builder
+
+WORKDIR /build
+USER root
+
+# Copy go module files first for better caching
+COPY go.mod go.sum* ./
+RUN go mod download 2>/dev/null || true
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o truenas-csi cmd/main.go
+
+# Stage 2: Get storage packages from CentOS Stream (RHEL-compatible)
+FROM quay.io/centos/centos:stream10 AS packages
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+    nfs-utils \
+    iscsi-initiator-utils \
+    e2fsprogs \
+    xfsprogs \
+    && dnf clean all
+
+# Stage 3: Final UBI-based image for Red Hat certification
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
+
+# Required Red Hat certification labels
+LABEL name="truenas-csi" \
+      vendor="TrueNAS" \
+      version="0.1.0" \
+      release="1" \
+      summary="TrueNAS CSI Driver for Kubernetes/OpenShift" \
+      description="Container Storage Interface driver for TrueNAS storage systems. Supports NFS and iSCSI protocols with snapshots, clones, and volume expansion." \
+      io.k8s.display-name="TrueNAS CSI Driver" \
+      io.k8s.description="CSI driver for dynamic provisioning of persistent volumes on TrueNAS storage" \
+      io.openshift.tags="storage,csi,truenas,nfs,iscsi" \
+      com.redhat.component="truenas-csi-container" \
+      maintainer="TrueNAS <support@truenas.com>"
+
+# Install base packages available in UBI
+RUN microdnf install -y --setopt=install_weak_deps=0 \
+    ca-certificates \
+    util-linux \
+    procps-ng \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum
+
+# Copy NFS utilities and dependencies from CentOS
+COPY --from=packages /usr/sbin/mount.nfs /usr/sbin/
+COPY --from=packages /usr/sbin/mount.nfs4 /usr/sbin/
+COPY --from=packages /usr/sbin/umount.nfs /usr/sbin/
+COPY --from=packages /usr/sbin/umount.nfs4 /usr/sbin/
+COPY --from=packages /usr/sbin/rpc.statd /usr/sbin/
+COPY --from=packages /usr/lib64/libnfsidmap.so* /usr/lib64/
+COPY --from=packages /usr/lib64/libtirpc.so* /usr/lib64/
+
+# Copy iSCSI utilities and dependencies from CentOS
+COPY --from=packages /usr/sbin/iscsiadm /usr/sbin/
+COPY --from=packages /usr/sbin/iscsid /usr/sbin/
+COPY --from=packages /usr/lib64/libisns.so* /usr/lib64/
+COPY --from=packages /usr/lib64/libkmod.so* /usr/lib64/
+COPY --from=packages /etc/iscsi /etc/iscsi
+
+# Copy filesystem utilities from CentOS
+COPY --from=packages /usr/sbin/mkfs.ext4 /usr/sbin/
+COPY --from=packages /usr/sbin/mkfs.xfs /usr/sbin/
+COPY --from=packages /usr/sbin/fsck.ext4 /usr/sbin/
+COPY --from=packages /usr/sbin/xfs_repair /usr/sbin/
+COPY --from=packages /usr/sbin/xfs_growfs /usr/sbin/
+COPY --from=packages /usr/sbin/resize2fs /usr/sbin/
+COPY --from=packages /usr/lib64/libext2fs.so* /usr/lib64/
+COPY --from=packages /usr/lib64/libcom_err.so* /usr/lib64/
+COPY --from=packages /usr/lib64/libe2p.so* /usr/lib64/
+
+# Copy license file (required for certification)
+COPY LICENSE /licenses/LICENSE
+
+# Copy binary from builder
+COPY --from=builder /build/truenas-csi /truenas-csi
+
+# Note: No USER directive set - CSI node driver requires root for mount operations.
+# For controller mode, use securityContext.runAsNonRoot in the Deployment.
+# The node DaemonSet mounts host's /etc/fstab which is required by mount.nfs.
+
+ENTRYPOINT ["/truenas-csi"]

@@ -168,23 +168,115 @@ See the [`examples/`](examples/) folder for sample configurations:
 
 ### Build the binary
 ```bash
-go build -o truenas-csi-driver ./cmd/
+make build
 ```
 
-### Build the container image
+### Build container images
 ```bash
-docker build -t truenas-csi-driver:latest .
+# Build Alpine-based image (standard Kubernetes)
+make docker-build
+
+# Build UBI-based image (Red Hat OpenShift certification)
+make build-ubi
+```
+
+### Push to quay.io
+```bash
+# Login to quay.io
+docker login quay.io
+
+# Push UBI image to quay.io/truenas_solutions
+make push-ubi
+
+# Push all images (driver, operator, bundle)
+make push-all
 ```
 
 ### Run tests
 ```bash
-go test ./...
+make test
 ```
+
+## Container Images
+
+Images are published to [quay.io/truenas_solutions](https://quay.io/organization/truenas_solutions):
+
+| Image | Description |
+|-------|-------------|
+| `quay.io/truenas_solutions/truenas-csi` | CSI driver (UBI-based for OpenShift) |
+| `quay.io/truenas_solutions/truenas-csi-operator` | Kubernetes operator |
+| `quay.io/truenas_solutions/truenas-csi-operator-bundle` | OLM bundle for OperatorHub |
 
 ## Running the Demo
 
 For an interactive demonstration of all driver features using a local Kind cluster, see [docs/demo.md](docs/demo.md).
 
+## OpenShift
+
+The TrueNAS CSI Driver is certified for Red Hat OpenShift and available via OperatorHub.
+
+### Quick Start (OpenShift)
+
+1. **Install via OperatorHub**
+   - Navigate to **Operators** > **OperatorHub**
+   - Search for "TrueNAS CSI"
+   - Click **Install**
+
+2. **Create credentials secret**
+   ```yaml
+   apiVersion: v1
+   kind: Secret
+   metadata:
+     name: truenas-api-credentials
+     namespace: truenas-csi
+   stringData:
+     api-key: "YOUR-API-KEY"
+   ```
+
+3. **Create TrueNASCSI resource**
+   ```yaml
+   apiVersion: csi.truenas.io/v1alpha1
+   kind: TrueNASCSI
+   metadata:
+     name: truenas
+   spec:
+     truenasURL: "wss://your-truenas-ip/api/current"
+     credentialsSecret: "truenas-api-credentials"
+     defaultPool: "tank"
+     nfsServer: "your-truenas-ip"
+   ```
+
+### OpenShift Documentation
+
+- [Installation Guide](docs/openshift/installation.md) - Detailed installation steps
+- [Configuration Reference](docs/openshift/configuration.md) - CRD and StorageClass options
+- [Upgrade Guide](docs/openshift/upgrade.md) - Upgrade procedures
+- [Red Hat Certification Guide](docs/openshift/certification.md) - Certification process and requirements
+
+## Demo Scripts
+
+Interactive demo scripts are provided to test the CSI driver:
+
+### Standard Kubernetes (Kind)
+
+```bash
+# Set TrueNAS connection details in deploy/truenas-csi-driver.yaml, then:
+./demo-simple.sh
+```
+
+### OpenShift (CRC/OpenShift Local)
+
+```bash
+# Set environment variables
+export TRUENAS_IP=192.168.1.100
+export TRUENAS_API_KEY=your-api-key
+export TRUENAS_POOL=tank
+
+# Run the demo
+./demo-openshift.sh
+```
+
+Both demos provide interactive menus to test NFS/iSCSI provisioning, volume expansion, snapshots, and cloning.
 
 ## Contributing
 
