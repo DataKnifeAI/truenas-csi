@@ -1,5 +1,7 @@
 # GitLab CI: Build CSI driver, Docker images, publish to Harbor
 #
+# Workflow: Build on main (validation) → Tag for release → Publish images to Harbor
+#
 # Required CI/CD variables (Settings → CI/CD → Variables):
 #   HARBOR_REGISTRY - Harbor registry URL (e.g. harbor.example.com)
 #   HARBOR_PROJECT  - Harbor project name (default: library)
@@ -22,6 +24,7 @@ variables:
     - cd $CI_PROJECT_DIR
     - go version
 
+# Build on main (CI validation) and on tags (prior to publish)
 build:
   stage: build
   <<: *build_template
@@ -42,7 +45,6 @@ build:
     name: moby/buildkit:rootless
     entrypoint: [""]
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_TAG
   tags:
     - kubernetes
@@ -122,13 +124,11 @@ release:
   image: registry.gitlab.com/gitlab-org/cli:latest
   rules:
     - if: $CI_COMMIT_TAG
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - echo "Creating release for commit $CI_COMMIT_SHORT_SHA"
+    - echo "Creating release $CI_COMMIT_TAG"
   release:
-    tag_name: "v0.$CI_PIPELINE_IID"
-    description: "Release v0.$CI_PIPELINE_IID"
+    tag_name: "$CI_COMMIT_TAG"
+    description: "Release $CI_COMMIT_TAG"
     ref: "$CI_COMMIT_SHA"
   tags:
     - kubernetes
