@@ -1,0 +1,18 @@
+# StorageClass for PostgreSQL (CloudNativePG) - NFS with mapall postgres user/group
+# Prerequisite: Create a postgres user on TrueNAS with UID 26 and GID 26 to match
+# the CloudNativePG container user
+# System → Users → Add → Username: postgres, UID: 26, Primary Group: postgres (GID 26)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: truenas-csi-nfs-postgres
+provisioner: csi.truenas.io
+parameters:
+  protocol: "nfs"
+  pool: "SAS"
+  compression: "LZ4"
+  nfs.mapAllUser: "postgres"
+  nfs.mapAllGroup: "postgres"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true

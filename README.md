@@ -204,6 +204,7 @@ sudo systemctl enable microk8s-mount-propagation
 See the [`examples/`](examples/) folder for sample configurations:
 
 - `storageclass-nfs.yaml` - Basic NFS StorageClass
+- `storageclass-nfs-postgres.yaml` - NFS for PostgreSQL (CloudNativePG) with mapall user/group
 - `storageclass-nfs-compressed.yaml` - NFS with ZSTD compression
 - `storageclass-iscsi.yaml` - Basic iSCSI StorageClass
 - `storageclass-iscsi-chap.yaml` - iSCSI with CHAP authentication
