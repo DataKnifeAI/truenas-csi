@@ -438,13 +438,20 @@ func (s *ControllerServer) createNFSVolume(ctx context.Context, volumeID, datase
 
 	stringPtr := func(s string) *string { return &s }
 
-	mapAllUser := defaultNFSMapAllUser
-	if val, ok := parameters[paramNFSMapAllUser]; ok && val != "" {
-		mapAllUser = val
+	var mapAllUserPtr, mapAllGroupPtr *string
+	if val, ok := parameters[paramNFSMapAllUser]; ok {
+		if val != "" {
+			mapAllUserPtr = stringPtr(val)
+		}
+	} else {
+		mapAllUserPtr = stringPtr(defaultNFSMapAllUser)
 	}
-	mapAllGroup := defaultNFSMapAllGroup
-	if val, ok := parameters[paramNFSMapAllGroup]; ok && val != "" {
-		mapAllGroup = val
+	if val, ok := parameters[paramNFSMapAllGroup]; ok {
+		if val != "" {
+			mapAllGroupPtr = stringPtr(val)
+		}
+	} else {
+		mapAllGroupPtr = stringPtr(defaultNFSMapAllGroup)
 	}
 
 	shareOpts := &client.NFSShareCreateOptions{
@@ -452,8 +459,8 @@ func (s *ControllerServer) createNFSVolume(ctx context.Context, volumeID, datase
 		Comment:     fmt.Sprintf("CSI volume %s", volumeID),
 		Enabled:     true,
 		ReadOnly:    false,
-		MapAllUser:  stringPtr(mapAllUser),
-		MapAllGroup: stringPtr(mapAllGroup),
+		MapAllUser:  mapAllUserPtr,
+		MapAllGroup: mapAllGroupPtr,
 	}
 
 	if hosts, ok := parameters[paramNFSHosts]; ok {
@@ -1023,13 +1030,20 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 
 	stringPtr := func(s string) *string { return &s }
 
-	mapAllUser := defaultNFSMapAllUser
-	if val, ok := parameters[paramNFSMapAllUser]; ok && val != "" {
-		mapAllUser = val
+	var mapAllUserPtr, mapAllGroupPtr *string
+	if val, ok := parameters[paramNFSMapAllUser]; ok {
+		if val != "" {
+			mapAllUserPtr = stringPtr(val)
+		}
+	} else {
+		mapAllUserPtr = stringPtr(defaultNFSMapAllUser)
 	}
-	mapAllGroup := defaultNFSMapAllGroup
-	if val, ok := parameters[paramNFSMapAllGroup]; ok && val != "" {
-		mapAllGroup = val
+	if val, ok := parameters[paramNFSMapAllGroup]; ok {
+		if val != "" {
+			mapAllGroupPtr = stringPtr(val)
+		}
+	} else {
+		mapAllGroupPtr = stringPtr(defaultNFSMapAllGroup)
 	}
 
 	shareOpts := &client.NFSShareCreateOptions{
@@ -1037,8 +1051,8 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 		Comment:     fmt.Sprintf("CSI volume clone %s", volumeID),
 		Enabled:     true,
 		ReadOnly:    false,
-		MapAllUser:  stringPtr(mapAllUser),
-		MapAllGroup: stringPtr(mapAllGroup),
+		MapAllUser:  mapAllUserPtr,
+		MapAllGroup: mapAllGroupPtr,
 	}
 
 	if hosts, ok := parameters[paramNFSHosts]; ok {

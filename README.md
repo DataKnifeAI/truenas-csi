@@ -163,8 +163,8 @@ sudo systemctl enable microk8s-mount-propagation
 | `nfs.hosts` | Allowed hosts | `10.0.0.0/8,192.168.1.0/24` |
 | `nfs.networks` | Allowed networks | `10.0.0.0/8` |
 | `nfs.mountOptions` | Client mount options | `hard,nfsvers=4.1` |
-| `nfs.mapAllUser` | NFS user mapping (default: `root`) | `postgres` |
-| `nfs.mapAllGroup` | NFS group mapping (default: `wheel`) | `postgres` |
+| `nfs.mapAllUser` | NFS user mapping (default: `root`); empty string omits mapall | `postgres` or `""` |
+| `nfs.mapAllGroup` | NFS group mapping (default: `wheel`); empty string omits mapall | `postgres` or `""` |
 
 #### iSCSI Parameters
 
@@ -204,7 +204,8 @@ sudo systemctl enable microk8s-mount-propagation
 See the [`examples/`](examples/) folder for sample configurations:
 
 - `storageclass-nfs.yaml` - Basic NFS StorageClass
-- `storageclass-nfs-postgres.yaml` - NFS for PostgreSQL (CloudNativePG) with mapall user/group
+- `storageclass-nfs-no-mapall.yaml` - NFS with mapall omitted (preserves client UID/GID, e.g. PostgreSQL)
+- `storageclass-nfs-postgres.yaml` - NFS for PostgreSQL with mapall postgres user/group (requires user on TrueNAS)
 - `storageclass-nfs-compressed.yaml` - NFS with ZSTD compression
 - `storageclass-iscsi.yaml` - Basic iSCSI StorageClass
 - `storageclass-iscsi-chap.yaml` - iSCSI with CHAP authentication
