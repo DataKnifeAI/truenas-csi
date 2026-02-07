@@ -1,0 +1,39 @@
+# Sync with upstream truenas/truenas-csi
+# Runs weekly and can be triggered manually
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync from upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/truenas/truenas-csi.git 2>/dev/null || true
+          git fetch upstream
+
+      - name: Merge upstream
+        run: |
+          # Upstream truenas/truenas-csi uses master as default branch
+          git merge upstream/master -m "chore: sync with upstream truenas/truenas-csi" --no-edit
+
+      - name: Push to origin
+        run: git push origin HEAD:main

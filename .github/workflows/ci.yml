@@ -48,7 +48,8 @@ jobs:
 
       - name: Validate Kubernetes Manifests
         run: |
-          IGNORE_CHECKS="container-image-tag,pod-networkpolicy,deployment-has-poddisruptionbudget,container-security-context-readonlyrootfilesystem,container-security-context-user-group-id"
+          # CSI drivers require privileged mode, often use latest tag; skip checks not applicable to upstream manifests
+          IGNORE_CHECKS="container-image-tag,pod-networkpolicy,deployment-has-poddisruptionbudget,container-security-context-readonlyrootfilesystem,container-security-context-user-group-id,container-security-context-privileged,container-image-pull-policy,container-resources,container-ephemeral-storage-request-and-limit,container-security-context"
           ERROR_COUNT=0
           for dir in deploy examples; do
             [ ! -d "$dir" ] && continue
