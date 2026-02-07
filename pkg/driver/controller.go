@@ -988,11 +988,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
 
-	// Validate node exists - in single-node deployments, check against our node ID
-	// In multi-node deployments, this should be expanded to track all registered nodes
-	if req.NodeId != s.driver.NodeID() {
-		return nil, status.Errorf(codes.NotFound, "node %s not found", req.NodeId)
-	}
+	// No node validation - publish context (nfsServer/nfsPath or portal/IQN/LUN) is identical for all nodes.
+	// The node plugin performs the actual mount at NodeStageVolume; invalid nodes would fail there.
 
 	// Parse volume ID to get dataset path
 	pool, name, err := s.driver.ParseVolumeID(req.VolumeId)
