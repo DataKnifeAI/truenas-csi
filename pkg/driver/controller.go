@@ -349,11 +349,19 @@ func (s *ControllerServer) createNFSVolume(ctx context.Context, volumeID, datase
 		MapAllGroup: stringPtr("wheel"),
 	}
 
-	if user, ok := parameters["nfs.mapAllUser"]; ok && user != "" {
-		shareOpts.MapAllUser = &user
+	if user, ok := parameters["nfs.mapAllUser"]; ok {
+		if user != "" {
+			shareOpts.MapAllUser = &user
+		} else {
+			shareOpts.MapAllUser = nil // omit mapall; non-root UIDs preserve identity
+		}
 	}
-	if group, ok := parameters["nfs.mapAllGroup"]; ok && group != "" {
-		shareOpts.MapAllGroup = &group
+	if group, ok := parameters["nfs.mapAllGroup"]; ok {
+		if group != "" {
+			shareOpts.MapAllGroup = &group
+		} else {
+			shareOpts.MapAllGroup = nil // omit mapall; non-root GIDs preserve identity
+		}
 	}
 
 	if hosts, ok := parameters["nfs.hosts"]; ok {
@@ -806,11 +814,19 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 		MapAllGroup: stringPtr("wheel"),
 	}
 
-	if user, ok := parameters["nfs.mapAllUser"]; ok && user != "" {
-		shareOpts.MapAllUser = &user
+	if user, ok := parameters["nfs.mapAllUser"]; ok {
+		if user != "" {
+			shareOpts.MapAllUser = &user
+		} else {
+			shareOpts.MapAllUser = nil // omit mapall; non-root UIDs preserve identity
+		}
 	}
-	if group, ok := parameters["nfs.mapAllGroup"]; ok && group != "" {
-		shareOpts.MapAllGroup = &group
+	if group, ok := parameters["nfs.mapAllGroup"]; ok {
+		if group != "" {
+			shareOpts.MapAllGroup = &group
+		} else {
+			shareOpts.MapAllGroup = nil // omit mapall; non-root GIDs preserve identity
+		}
 	}
 
 	share, err := s.driver.Client().CreateNFSShare(ctx, shareOpts)
