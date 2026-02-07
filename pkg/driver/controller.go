@@ -349,6 +349,13 @@ func (s *ControllerServer) createNFSVolume(ctx context.Context, volumeID, datase
 		MapAllGroup: stringPtr("wheel"),
 	}
 
+	if user, ok := parameters["nfs.mapAllUser"]; ok && user != "" {
+		shareOpts.MapAllUser = &user
+	}
+	if group, ok := parameters["nfs.mapAllGroup"]; ok && group != "" {
+		shareOpts.MapAllGroup = &group
+	}
+
 	if hosts, ok := parameters["nfs.hosts"]; ok {
 		shareOpts.Hosts = strings.Split(hosts, ",")
 	}
@@ -789,11 +796,21 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 		mountpoint = fmt.Sprintf("/mnt/%s", datasetPath)
 	}
 
+	stringPtr := func(s string) *string { return &s }
 	shareOpts := &client.NFSShareCreateOptions{
-		Path:     mountpoint,
-		Comment:  fmt.Sprintf("CSI volume clone %s", volumeID),
-		Enabled:  true,
-		ReadOnly: false,
+		Path:        mountpoint,
+		Comment:     fmt.Sprintf("CSI volume clone %s", volumeID),
+		Enabled:     true,
+		ReadOnly:    false,
+		MapAllUser:  stringPtr("root"),
+		MapAllGroup: stringPtr("wheel"),
+	}
+
+	if user, ok := parameters["nfs.mapAllUser"]; ok && user != "" {
+		shareOpts.MapAllUser = &user
+	}
+	if group, ok := parameters["nfs.mapAllGroup"]; ok && group != "" {
+		shareOpts.MapAllGroup = &group
 	}
 
 	share, err := s.driver.Client().CreateNFSShare(ctx, shareOpts)

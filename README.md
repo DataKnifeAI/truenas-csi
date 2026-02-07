@@ -117,6 +117,8 @@ kubectl get csidrivers
 | `nfs.hosts` | Allowed hosts | `10.0.0.0/8,192.168.1.0/24` |
 | `nfs.networks` | Allowed networks | `10.0.0.0/8` |
 | `nfs.mountOptions` | Client mount options | `hard,nfsvers=4.1` |
+| `nfs.mapAllUser` | Mapall user for NFS export | `postgres` |
+| `nfs.mapAllGroup` | Mapall group for NFS export | `postgres` |
 
 #### iSCSI Parameters
 
@@ -156,6 +158,7 @@ kubectl get csidrivers
 See the [`examples/`](examples/) folder for sample configurations:
 
 - `storageclass-nfs.yaml` - Basic NFS StorageClass
+- `storageclass-nfs-postgres.yaml` - NFS for PostgreSQL (CloudNativePG) with mapall user/group
 - `storageclass-nfs-compressed.yaml` - NFS with ZSTD compression
 - `storageclass-iscsi.yaml` - Basic iSCSI StorageClass
 - `storageclass-iscsi-chap.yaml` - iSCSI with CHAP authentication
