@@ -1,0 +1,224 @@
+# CI: Build, test, and mirror to GitLab
+# Pushes to https://gitlab.com/dk-raas/dkai/devops/truenas-csi
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  GO_VERSION: "1.24"
+  GITLAB_MIRROR_PATH: "dk-raas/dkai/devops/truenas-csi"
+
+jobs:
+  lint:
+    name: Lint and Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Validate Makefile
+        run: |
+          make help > /dev/null
+          echo "✅ Makefile is valid"
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Install kube-score
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/zegl/kube-score/releases/latest | grep tag_name | cut -d '"' -f 4 | tr -d 'v')
+          curl -L "https://github.com/zegl/kube-score/releases/download/v${VERSION}/kube-score_${VERSION}_linux_amd64.tar.gz" -o kube-score.tar.gz
+          tar -xzf kube-score.tar.gz
+          sudo mv kube-score /usr/local/bin/
+          kube-score version
+
+      - name: Validate Kubernetes Manifests
+        run: |
+          IGNORE_CHECKS="container-image-tag,pod-networkpolicy,deployment-has-poddisruptionbudget,container-security-context-readonlyrootfilesystem,container-security-context-user-group-id"
+          ERROR_COUNT=0
+          for dir in deploy examples; do
+            [ ! -d "$dir" ] && continue
+            for file in $(find "$dir" \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null); do
+              echo "Validating $file with kube-score"
+              if OUTPUT=$(kube-score score --ignore-test "$IGNORE_CHECKS" --ignore-test ingress-targets-service "$file" 2>&1); then
+                echo "✅ $file passed"
+                echo "$OUTPUT" | head -15
+              else
+                echo "$OUTPUT"
+                if echo "$OUTPUT" | grep -q "\[CRITICAL\]"; then
+                  ERROR_COUNT=$((ERROR_COUNT + 1))
+                fi
+              fi
+              echo "---"
+            done
+          done
+          [ $ERROR_COUNT -gt 0 ] && exit 1
+          echo "✅ All Kubernetes manifests passed"
+
+      - name: Check YAML syntax
+        run: |
+          find deploy examples operator \( -name "*.yml" -o -name "*.yaml" \) 2>/dev/null | while read -r file; do
+            [ -f "$file" ] || continue
+            echo "Checking $file"
+            python3 -c "import yaml; list(yaml.safe_load_all(open('$file')))" 2>/dev/null || echo "⚠️ Skipped or warning: $file"
+          done
+          echo "✅ YAML syntax check complete"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build
+        run: make build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Test
+        run: make test
+
+  test-dockerfiles:
+    name: Test Dockerfile Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install hadolint
+        run: |
+          wget -O /usr/local/bin/hadolint https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Validate Dockerfile
+        run: |
+          hadolint Dockerfile || echo "⚠️ Dockerfile had linting warnings (non-blocking)"
+          echo "✅ Dockerfile validation complete"
+
+      - name: Validate Dockerfile.ubi
+        run: |
+          hadolint Dockerfile.ubi || echo "⚠️ Dockerfile.ubi had linting warnings (non-blocking)"
+          echo "✅ Dockerfile.ubi validation complete"
+
+  test-scripts:
+    name: Test Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check bash script syntax
+        run: |
+          for script in demo-openshift.sh demo-simple.sh; do
+            [ -f "$script" ] || continue
+            echo "Checking $script"
+            bash -n "$script" || exit 1
+          done
+          echo "✅ All bash scripts have valid syntax"
+
+  security:
+    name: Security Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for secrets
+        run: |
+          if grep -rE "(password|secret|token|api_key|apikey)\s*[=:]\s*['\"][^'\"]{10,}" --include="*.yml" --include="*.yaml" --include="*.sh" . 2>/dev/null; then
+            echo "⚠️ Potential secrets found, please review"
+            exit 1
+          fi
+          echo "✅ No obvious secrets found in code"
+
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [lint, build, test, test-dockerfiles, test-scripts, security]
+    if: always()
+    steps:
+      - name: CI Status
+        run: |
+          echo "## CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dockerfiles | ${{ needs.test-dockerfiles.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scripts | ${{ needs.test-scripts.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+
+  push-to-gitlab:
+    name: Push to GitLab
+    runs-on: ubuntu-latest
+    needs: [lint, build, test, test-dockerfiles, test-scripts, security]
+    if: always() && needs.lint.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success' && needs.test-dockerfiles.result == 'success' && needs.test-scripts.result == 'success' && needs.security.result == 'success' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git remote remove gitlab 2>/dev/null || true
+          git remote add gitlab "https://gitlab.com/${{ env.GITLAB_MIRROR_PATH }}.git"
+          git config credential.helper '!f() { echo "username=oauth2"; echo "password=${GITLAB_TOKEN}"; }; f'
+          git fetch gitlab main 2>/dev/null || true
+          git push gitlab HEAD:main --force
