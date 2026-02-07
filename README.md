@@ -165,6 +165,9 @@ sudo systemctl enable microk8s-mount-propagation
 | `nfs.mountOptions` | Client mount options | `hard,nfsvers=4.1` |
 | `nfs.mapAllUser` | NFS user mapping (default: `root`); empty string omits mapall | `postgres` or `""` |
 | `nfs.mapAllGroup` | NFS group mapping (default: `wheel`); empty string omits mapall | `postgres` or `""` |
+| `nfs.datasetPermissionsMode` | Unix mode for dataset root (octal) | `0777` |
+| `nfs.datasetPermissionsUser` | UID for dataset owner (numeric string) | `0` |
+| `nfs.datasetPermissionsGroup` | GID for dataset group (numeric string) | `0` |
 
 #### iSCSI Parameters
 

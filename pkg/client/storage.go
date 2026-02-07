@@ -2,9 +2,11 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // TrueNAS API method names for datasets
@@ -67,6 +69,12 @@ const (
 // TrueNAS API method names for ZFS resources
 const (
 	methodZFSResourceQuery = "zfs.resource.query"
+)
+
+// TrueNAS API method names for filesystem and core (jobs)
+const (
+	methodFilesystemSetperm = "filesystem.setperm"
+	methodCoreGetJobs       = "core.get_jobs"
 )
 
 // Default configuration values
@@ -467,6 +475,22 @@ type ZFSProperty struct {
 type ZFSPropSource struct {
 	Type  string `json:"type"`
 	Value any    `json:"value"`
+}
+
+// FilesystemSetpermOptions specifies options for filesystem.setperm.
+type FilesystemSetpermOptions struct {
+	Path    string                  `json:"path"`
+	Mode    string                  `json:"mode,omitempty"`
+	UID     *int                    `json:"uid,omitempty"`
+	GID     *int                    `json:"gid,omitempty"`
+	Options *FilesystemSetpermOpts  `json:"options,omitempty"`
+}
+
+// FilesystemSetpermOpts specifies setperm options (stripacl, recursive, traverse).
+type FilesystemSetpermOpts struct {
+	StripACL  bool `json:"stripacl"`
+	Recursive bool `json:"recursive"`
+	Traverse  bool `json:"traverse"`
 }
 
 // GetInt64 returns the property value as int64.
@@ -1281,6 +1305,107 @@ func (c *Client) GetAvailableSpace(ctx context.Context, poolName string) (int64,
 		return 0, fmt.Errorf("'available' property is null for ZFS resource %s", poolName)
 	default:
 		return 0, fmt.Errorf("unexpected type %T for 'available' property of ZFS resource %s", v, poolName)
+	}
+}
+
+// SetDatasetPermissions calls filesystem.setperm to set mode/uid/gid on a path.
+// Returns job ID. Caller must poll WaitForJob until job completes.
+func (c *Client) SetDatasetPermissions(ctx context.Context, opts *FilesystemSetpermOptions) (string, error) {
+	if opts == nil || opts.Path == "" || opts.Mode == "" {
+		return "", fmt.Errorf("path and mode are required for setperm")
+	}
+	params := map[string]any{
+		"path": opts.Path,
+		"mode": opts.Mode,
+	}
+	if opts.UID != nil {
+		params["uid"] = *opts.UID
+	}
+	if opts.GID != nil {
+		params["gid"] = *opts.GID
+	}
+	if opts.Options != nil {
+		params["options"] = opts.Options
+	} else {
+		params["options"] = &FilesystemSetpermOpts{StripACL: false, Recursive: false, Traverse: false}
+	}
+	var result any
+	err := c.Call(ctx, methodFilesystemSetperm, []any{params}, &result)
+	if err != nil {
+		return "", fmt.Errorf("filesystem.setperm failed: %w", err)
+	}
+	// TrueNAS may return job ID as string or as object {"id": 123}
+	switch v := result.(type) {
+	case string:
+		return v, nil
+	case float64:
+		return strconv.FormatInt(int64(v), 10), nil
+	case nil:
+		return "", fmt.Errorf("filesystem.setperm returned nil")
+	default:
+		if m, ok := result.(map[string]any); ok {
+			if id, ok := m["id"]; ok {
+				switch idv := id.(type) {
+				case string:
+					return idv, nil
+				case float64:
+					return strconv.FormatInt(int64(idv), 10), nil
+				}
+			}
+		}
+		// Return as JSON string for debugging
+		b, _ := json.Marshal(result)
+		return "", fmt.Errorf("unexpected setperm result format: %s", string(b))
+	}
+}
+
+// WaitForJob polls core.get_jobs until job completes or context times out.
+func (c *Client) WaitForJob(ctx context.Context, jobID string, timeout time.Duration) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(timeout)
+	} else if t := time.Now().Add(timeout); t.Before(deadline) {
+		deadline = t
+	}
+	pollCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	// Parse jobID to int if numeric (TrueNAS may use numeric IDs)
+	filters := [][]any{{"id", "=", jobID}}
+	if id, err := strconv.Atoi(jobID); err == nil {
+		filters = [][]any{{"id", "=", id}}
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-pollCtx.Done():
+			return fmt.Errorf("job %s: %w", jobID, pollCtx.Err())
+		case <-ticker.C:
+		}
+
+		var jobs []map[string]any
+		err := c.Call(pollCtx, methodCoreGetJobs, []any{filters, map[string]any{}}, &jobs)
+		if err != nil {
+			return fmt.Errorf("core.get_jobs failed: %w", err)
+		}
+		if len(jobs) == 0 {
+			continue
+		}
+		job := jobs[0]
+		state, _ := job["state"].(string)
+		switch state {
+		case "SUCCESS":
+			return nil
+		case "ABORTED", "FAILED":
+			msg, _ := job["error"].(string)
+			if msg == "" {
+				msg = state
+			}
+			return fmt.Errorf("job %s %s: %s", jobID, state, msg)
+		}
 	}
 }
 
