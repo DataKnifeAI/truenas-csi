@@ -169,6 +169,28 @@ func (s *ControllerServer) validateStorageClassParameters(ctx context.Context, p
 		}
 	}
 
+	// Validate NFS dataset permissions
+	if mode, ok := parameters["nfs.datasetPermissionsMode"]; ok && mode != "" {
+		if len(mode) != 4 || mode[0] != '0' {
+			return fmt.Errorf("invalid nfs.datasetPermissionsMode: %s (must be octal string e.g. 0777, 0755)", mode)
+		}
+		for _, c := range mode[1:] {
+			if c < '0' || c > '7' {
+				return fmt.Errorf("invalid nfs.datasetPermissionsMode: %s (must be octal)", mode)
+			}
+		}
+	}
+	if val, ok := parameters["nfs.datasetPermissionsUser"]; ok && val != "" {
+		if _, err := strconv.Atoi(val); err != nil {
+			return fmt.Errorf("invalid nfs.datasetPermissionsUser: %s (must be numeric)", val)
+		}
+	}
+	if val, ok := parameters["nfs.datasetPermissionsGroup"]; ok && val != "" {
+		if _, err := strconv.Atoi(val); err != nil {
+			return fmt.Errorf("invalid nfs.datasetPermissionsGroup: %s (must be numeric)", val)
+		}
+	}
+
 	return nil
 }
 
@@ -336,6 +358,34 @@ func (s *ControllerServer) createNFSVolume(ctx context.Context, volumeID, datase
 	mountpoint := dataset.Mountpoint
 	if mountpoint == "" {
 		mountpoint = filepath.Join(DefaultMountpoint, datasetPath)
+	}
+
+	// Set dataset permissions if requested (Democratic CSI behavior)
+	if mode, ok := parameters["nfs.datasetPermissionsMode"]; ok && mode != "" {
+		perms := &client.FilesystemSetpermOptions{
+			Path: mountpoint,
+			Mode: mode,
+		}
+		if u, ok := parameters["nfs.datasetPermissionsUser"]; ok && u != "" {
+			if uid, err := strconv.Atoi(u); err == nil {
+				perms.UID = &uid
+			}
+		}
+		if g, ok := parameters["nfs.datasetPermissionsGroup"]; ok && g != "" {
+			if gid, err := strconv.Atoi(g); err == nil {
+				perms.GID = &gid
+			}
+		}
+		jobID, err := s.driver.Client().SetDatasetPermissions(ctx, perms)
+		if err != nil {
+			s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
+			return nil, fmt.Errorf("failed to set dataset permissions: %w", err)
+		}
+		if err := s.driver.Client().WaitForJob(ctx, jobID, 30*time.Second); err != nil {
+			s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
+			return nil, fmt.Errorf("dataset permissions job failed: %w", err)
+		}
+		s.driver.Log().V(LogLevelDebug).Info("Set dataset permissions", "path", mountpoint, "mode", mode)
 	}
 
 	stringPtr := func(s string) *string { return &s }
@@ -802,6 +852,32 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 	mountpoint := dataset.Mountpoint
 	if mountpoint == "" {
 		mountpoint = fmt.Sprintf("/mnt/%s", datasetPath)
+	}
+
+	// Set dataset permissions if requested (Democratic CSI behavior)
+	if mode, ok := parameters["nfs.datasetPermissionsMode"]; ok && mode != "" {
+		perms := &client.FilesystemSetpermOptions{
+			Path: mountpoint,
+			Mode: mode,
+		}
+		if u, ok := parameters["nfs.datasetPermissionsUser"]; ok && u != "" {
+			if uid, err := strconv.Atoi(u); err == nil {
+				perms.UID = &uid
+			}
+		}
+		if g, ok := parameters["nfs.datasetPermissionsGroup"]; ok && g != "" {
+			if gid, err := strconv.Atoi(g); err == nil {
+				perms.GID = &gid
+			}
+		}
+		jobID, err := s.driver.Client().SetDatasetPermissions(ctx, perms)
+		if err != nil {
+			return nil, fmt.Errorf("failed to set dataset permissions: %w", err)
+		}
+		if err := s.driver.Client().WaitForJob(ctx, jobID, 30*time.Second); err != nil {
+			return nil, fmt.Errorf("dataset permissions job failed: %w", err)
+		}
+		s.driver.Log().V(LogLevelDebug).Info("Set dataset permissions for clone", "path", mountpoint, "mode", mode)
 	}
 
 	stringPtr := func(s string) *string { return &s }

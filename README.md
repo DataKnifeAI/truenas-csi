@@ -119,6 +119,9 @@ kubectl get csidrivers
 | `nfs.mountOptions` | Client mount options | `hard,nfsvers=4.1` |
 | `nfs.mapAllUser` | Mapall user; omit when empty (preserves client UID) | `postgres` or `""` |
 | `nfs.mapAllGroup` | Mapall group; omit when empty (preserves client GID) | `postgres` or `""` |
+| `nfs.datasetPermissionsMode` | Unix mode for dataset root (octal) | `0777` |
+| `nfs.datasetPermissionsUser` | UID for dataset owner (numeric string) | `0` |
+| `nfs.datasetPermissionsGroup` | GID for dataset group (numeric string) | `0` |
 
 #### iSCSI Parameters
 

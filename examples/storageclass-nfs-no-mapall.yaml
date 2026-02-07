@@ -1,6 +1,6 @@
-# StorageClass for PostgreSQL (CloudNativePG) - NFS with mapall omitted
-# Empty nfs.mapAllUser/nfs.mapAllGroup omits mapall from the NFS export.
-# Non-root client UIDs (e.g. postgres UID 26) preserve identity on the server.
+# StorageClass for PostgreSQL (CloudNativePG) - NFS with mapall omitted + dataset permissions
+# Empty nfs.mapAllUser/nfs.mapAllGroup omits mapall; non-root UIDs preserve identity.
+# nfs.datasetPermissionsMode 0777 allows any UID to write (Democratic CSI behavior).
 # No TrueNAS user creation required.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -13,6 +13,9 @@ parameters:
   compression: "LZ4"
   nfs.mapAllUser: ""
   nfs.mapAllGroup: ""
+  nfs.datasetPermissionsMode: "0777"
+  nfs.datasetPermissionsUser: "0"
+  nfs.datasetPermissionsGroup: "0"
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: true
