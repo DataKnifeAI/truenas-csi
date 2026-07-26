@@ -59,7 +59,7 @@ bump-version: ## Update all hardcoded version refs (e.g. make bump-version VERSI
 
 .PHONY: docker-build
 docker-build: ## Build standard Docker image (Alpine-based)
-	docker build --build-arg VERSION=$(VERSION) -t $(DRIVER_IMAGE):$(IMG_TAG) .
+	docker build --build-arg VERSION=$(IMG_TAG) -t $(DRIVER_IMAGE):$(IMG_TAG) .
 
 .PHONY: docker-push
 docker-push: ## Push standard Docker image
@@ -69,7 +69,7 @@ docker-push: ## Push standard Docker image
 
 .PHONY: build-ubi
 build-ubi: ## Build UBI-based driver image for Red Hat certification
-	docker build --pull -f Dockerfile.ubi --provenance=false --sbom=false --build-arg VERSION=$(VERSION) -t $(DRIVER_IMAGE):$(IMG_TAG) .
+	docker build --pull -f Dockerfile.ubi --provenance=false --sbom=false --build-arg VERSION=$(IMG_TAG) -t $(DRIVER_IMAGE):$(IMG_TAG) .
 
 .PHONY: push-ubi
 push-ubi: ## Push UBI-based driver image

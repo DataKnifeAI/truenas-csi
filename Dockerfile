@@ -4,8 +4,9 @@ WORKDIR /build
 COPY go.mod go.sum* ./
 RUN go mod download 2>/dev/null || true
 COPY . .
+ARG TARGETARCH=amd64
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X github.com/truenas/truenas-csi/pkg/driver.DRIVER_VERSION=${VERSION}" -o truenas-csi-driver cmd/main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-X github.com/truenas/truenas-csi/pkg/driver.DRIVER_VERSION=${VERSION}" -o truenas-csi-driver cmd/main.go
 
 FROM alpine:3.19
 # On Alpine, `resize2fs` lives in `e2fsprogs-extra` (not the base `e2fsprogs`),
