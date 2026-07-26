@@ -71,6 +71,8 @@ publish-truenas-csi:
       echo "Registry: $HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME"
       
       IMAGE_TAG="${CI_COMMIT_SHORT_SHA:-$CI_PIPELINE_ID}"
+      # Embed release identity in the binary (Dockerfile defaults VERSION=dev).
+      DRIVER_VERSION="${CI_COMMIT_TAG:-v${CI_COMMIT_SHORT_SHA}}"
       OUTPUT_FLAGS="--output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME:latest,push=true"
       OUTPUT_FLAGS="$OUTPUT_FLAGS --output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME:$IMAGE_TAG,push=true"
       
@@ -80,6 +82,7 @@ publish-truenas-csi:
       
       buildctl-daemonless.sh build \
         --frontend dockerfile.v0 \
+        --opt build-arg:VERSION="${DRIVER_VERSION}" \
         --local context=. \
         --local dockerfile=. \
         $OUTPUT_FLAGS
@@ -104,6 +107,7 @@ publish-truenas-csi-ubi:
       echo "Registry: $HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_UBI"
       
       IMAGE_TAG="${CI_COMMIT_SHORT_SHA:-$CI_PIPELINE_ID}"
+      DRIVER_VERSION="${CI_COMMIT_TAG:-v${CI_COMMIT_SHORT_SHA}}"
       OUTPUT_FLAGS="--output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_UBI:latest,push=true"
       OUTPUT_FLAGS="$OUTPUT_FLAGS --output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_UBI:$IMAGE_TAG,push=true"
       
@@ -114,6 +118,7 @@ publish-truenas-csi-ubi:
       cp Dockerfile.ubi Dockerfile
       buildctl-daemonless.sh build \
         --frontend dockerfile.v0 \
+        --opt build-arg:VERSION="${DRIVER_VERSION}" \
         --local context=. \
         --local dockerfile=. \
         $OUTPUT_FLAGS

@@ -51,10 +51,17 @@ func TestVersionSupported(t *testing.T) {
 		t.Error("expected v25.10.0 to be supported")
 	}
 	if versionSupported(supported, "v26.0.0") {
-		t.Error("did not expect v26.0.0 to be supported")
+		t.Error("did not expect v26.0.0 to be supported when only 25.x is advertised")
 	}
 	if versionSupported(nil, "v25.10.0") {
 		t.Error("empty list should support nothing")
+	}
+	// Newer patch alone should satisfy the minimum (exact string may be absent).
+	if !versionSupported([]string{"v25.10.1"}, "v25.10.0") {
+		t.Error("expected v25.10.1 to meet minimum v25.10.0")
+	}
+	if !versionSupported([]string{"v26.0.0"}, "v25.10.0") {
+		t.Error("expected v26.0.0 to meet minimum v25.10.0")
 	}
 }
 
