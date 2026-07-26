@@ -43,6 +43,14 @@ func TestApplyNFSShareParameters(t *testing.T) {
 			wantMapRootG: unset,
 		},
 		{
+			name:         "empty mapall omits mapall fields",
+			params:       map[string]string{paramNFSMapAllUser: "", paramNFSMapAllGroup: ""},
+			wantMapAllU:  unset,
+			wantMapAllG:  unset,
+			wantMapRootU: unset,
+			wantMapRootG: unset,
+		},
+		{
 			name:         "rootSquash=false uses maproot and omits mapall",
 			params:       map[string]string{paramNFSRootSquash: "false"},
 			wantMapAllU:  unset,

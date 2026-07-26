@@ -262,6 +262,28 @@ func (s *ControllerServer) validateStorageClassParameters(ctx context.Context, p
 		}
 	}
 
+	// Validate NFS dataset permissions (filesystem.setperm after create)
+	if mode, ok := parameters[paramNFSDatasetPermissionsMode]; ok && mode != "" {
+		if len(mode) != 4 || mode[0] != '0' {
+			return fmt.Errorf("invalid nfs.datasetPermissionsMode: %s (must be octal string e.g. 0777, 0755)", mode)
+		}
+		for _, c := range mode[1:] {
+			if c < '0' || c > '7' {
+				return fmt.Errorf("invalid nfs.datasetPermissionsMode: %s (must be octal)", mode)
+			}
+		}
+	}
+	if val, ok := parameters[paramNFSDatasetPermissionsUser]; ok && val != "" {
+		if _, err := strconv.Atoi(val); err != nil {
+			return fmt.Errorf("invalid nfs.datasetPermissionsUser: %s (must be numeric)", val)
+		}
+	}
+	if val, ok := parameters[paramNFSDatasetPermissionsGroup]; ok && val != "" {
+		if _, err := strconv.Atoi(val); err != nil {
+			return fmt.Errorf("invalid nfs.datasetPermissionsGroup: %s (must be numeric)", val)
+		}
+	}
+
 	// Validate snapshot schedule format
 	if schedule, ok := parameters[paramSnapshotSchedule]; ok && schedule != "" {
 		parts := strings.Fields(schedule)
@@ -450,11 +472,13 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 // applyNFSShareParameters configures an NFS share's user/group mapping and access
 // lists from StorageClass parameters. By default all access is squashed to a
 // single user via mapall (defaultNFSMapAllUser:defaultNFSMapAllGroup, overridable
-// via nfs.mapAllUser/nfs.mapAllGroup). Setting nfs.rootSquash="false" instead maps
-// incoming root to root:wheel (no_root_squash) and preserves other UIDs, so that a
-// pod fsGroup (the driver sets CSIDriver fsGroupPolicy: File) can chown the volume
-// root for ownership-sensitive non-root workloads such as PostgreSQL/CNPG. mapall
-// and no_root_squash are mutually exclusive — mapall would re-squash root — so the
+// via nfs.mapAllUser/nfs.mapAllGroup). An empty-string value for either mapall
+// parameter omits that field (Democratic CSI behavior: non-root client UIDs keep
+// their identity). Setting nfs.rootSquash="false" instead maps incoming root to
+// root:wheel (no_root_squash) and preserves other UIDs, so that a pod fsGroup
+// (the driver sets CSIDriver fsGroupPolicy: File) can chown the volume root for
+// ownership-sensitive non-root workloads such as PostgreSQL/CNPG. mapall and
+// no_root_squash are mutually exclusive — mapall would re-squash root — so the
 // mapall parameters are ignored when root squashing is disabled.
 func applyNFSShareParameters(opts *client.NFSShareCreateOptions, parameters map[string]string) {
 	stringPtr := func(s string) *string { return &s }
@@ -463,16 +487,20 @@ func applyNFSShareParameters(opts *client.NFSShareCreateOptions, parameters map[
 		opts.MapRootUser = stringPtr(defaultNFSMapRootUser)
 		opts.MapRootGroup = stringPtr(defaultNFSMapRootGroup)
 	} else {
-		mapAllUser := defaultNFSMapAllUser
-		if val, ok := parameters[paramNFSMapAllUser]; ok && val != "" {
-			mapAllUser = val
+		if val, ok := parameters[paramNFSMapAllUser]; ok {
+			if val != "" {
+				opts.MapAllUser = stringPtr(val)
+			}
+		} else {
+			opts.MapAllUser = stringPtr(defaultNFSMapAllUser)
 		}
-		mapAllGroup := defaultNFSMapAllGroup
-		if val, ok := parameters[paramNFSMapAllGroup]; ok && val != "" {
-			mapAllGroup = val
+		if val, ok := parameters[paramNFSMapAllGroup]; ok {
+			if val != "" {
+				opts.MapAllGroup = stringPtr(val)
+			}
+		} else {
+			opts.MapAllGroup = stringPtr(defaultNFSMapAllGroup)
 		}
-		opts.MapAllUser = stringPtr(mapAllUser)
-		opts.MapAllGroup = stringPtr(mapAllGroup)
 	}
 
 	if hosts, ok := parameters[paramNFSHosts]; ok {
@@ -481,6 +509,40 @@ func applyNFSShareParameters(opts *client.NFSShareCreateOptions, parameters map[
 	if networks, ok := parameters[paramNFSNetworks]; ok {
 		opts.Networks = strings.Split(networks, ",")
 	}
+}
+
+// applyNFSDatasetPermissions calls filesystem.setperm when StorageClass parameters
+// request a mode (and optional uid/gid) on the dataset mountpoint after create.
+func (s *ControllerServer) applyNFSDatasetPermissions(ctx context.Context, mountpoint, datasetPath string, parameters map[string]string) error {
+	mode, ok := parameters[paramNFSDatasetPermissionsMode]
+	if !ok || mode == "" {
+		return nil
+	}
+
+	perms := &client.FilesystemSetpermOptions{
+		Path: mountpoint,
+		Mode: mode,
+	}
+	if u, ok := parameters[paramNFSDatasetPermissionsUser]; ok && u != "" {
+		if uid, err := strconv.Atoi(u); err == nil {
+			perms.UID = &uid
+		}
+	}
+	if g, ok := parameters[paramNFSDatasetPermissionsGroup]; ok && g != "" {
+		if gid, err := strconv.Atoi(g); err == nil {
+			perms.GID = &gid
+		}
+	}
+
+	jobID, err := s.driver.Client().SetDatasetPermissions(ctx, perms)
+	if err != nil {
+		return fmt.Errorf("failed to set dataset permissions: %w", err)
+	}
+	if err := s.driver.Client().WaitForJob(ctx, jobID, 30*time.Second); err != nil {
+		return fmt.Errorf("dataset permissions job failed: %w", err)
+	}
+	s.driver.Log().V(LogLevelDebug).Info("Set dataset permissions", "path", mountpoint, "mode", mode, "dataset", datasetPath)
+	return nil
 }
 
 // createNFSVolume creates a ZFS filesystem dataset and NFS share for the volume.
@@ -532,6 +594,11 @@ func (s *ControllerServer) createNFSVolume(ctx context.Context, volumeID, datase
 	mountpoint := dataset.Mountpoint
 	if mountpoint == "" {
 		mountpoint = filepath.Join(DefaultMountpoint, datasetPath)
+	}
+
+	if err := s.applyNFSDatasetPermissions(ctx, mountpoint, datasetPath, parameters); err != nil {
+		s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
+		return nil, err
 	}
 
 	shareOpts := &client.NFSShareCreateOptions{
@@ -1473,6 +1540,10 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 	mountpoint := dataset.Mountpoint
 	if mountpoint == "" {
 		mountpoint = fmt.Sprintf("/mnt/%s", datasetPath)
+	}
+
+	if err := s.applyNFSDatasetPermissions(ctx, mountpoint, datasetPath, parameters); err != nil {
+		return nil, err
 	}
 
 	shareOpts := &client.NFSShareCreateOptions{

@@ -32,12 +32,18 @@ parameters:
   # nfs.hosts: "10.0.0.10,10.0.0.11"
   # nfs.networks: "10.0.0.0/8,192.168.1.0/24"
   # User/group all access is squashed to (mapall). Defaults root / wheel.
+  # Set to "" to omit mapall (preserve client UIDs; see storageclass-nfs-no-mapall.yaml).
   # nfs.mapAllUser: "root"
   # nfs.mapAllGroup: "wheel"
   # Set false for no_root_squash so a pod fsGroup can own the volume root —
   # required for ownership-sensitive non-root workloads (see
   # storageclass-nfs-fsgroup.yaml). Default: true (mapall in force).
   # nfs.rootSquash: "true"
+  # Unix mode/uid/gid on the dataset mountpoint after create (filesystem.setperm).
+  # Often paired with empty mapall (see storageclass-nfs-no-mapall.yaml).
+  # nfs.datasetPermissionsMode: "0777"
+  # nfs.datasetPermissionsUser: "0"
+  # nfs.datasetPermissionsGroup: "0"
 
   # --- Encryption (optional; see storageclass-encrypted.yaml) ---
   # encryption: "true"
