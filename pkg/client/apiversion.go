@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 )
 
 // MinAPIVersion is the minimum TrueNAS versioned API the driver requires.
@@ -85,14 +87,50 @@ func fetchSupportedAPIVersions(ctx context.Context, rawURL string, tlsConfig *tl
 	return versions, nil
 }
 
-// versionSupported reports whether target is present in supported.
-func versionSupported(supported []string, target string) bool {
+// versionSupported reports whether any advertised API version meets minVersion
+// (equal or newer). TrueNAS may drop older patch entries from /api/versions
+// (e.g. advertise v25.10.1 without v25.10.0); exact-string matching would
+// falsely reject those appliances.
+func versionSupported(supported []string, minVersion string) bool {
 	for _, v := range supported {
-		if v == target {
+		if apiVersionGTE(v, minVersion) {
 			return true
 		}
 	}
 	return false
+}
+
+// parseAPIVersion parses TrueNAS API versions like "v25.10.0" into [YY, MM, PATCH].
+func parseAPIVersion(v string) ([3]int, bool) {
+	var out [3]int
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i := 0; i < 3; i++ {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+// apiVersionGTE reports whether version v is greater than or equal to min.
+func apiVersionGTE(v, min string) bool {
+	vp, ok1 := parseAPIVersion(v)
+	mp, ok2 := parseAPIVersion(min)
+	if !ok1 || !ok2 {
+		return v == min
+	}
+	for i := 0; i < 3; i++ {
+		if vp[i] != mp[i] {
+			return vp[i] > mp[i]
+		}
+	}
+	return true
 }
 
 // verifyAndPinAPIVersion rewrites the client's URL to the pinned API version and
