@@ -26,12 +26,15 @@ const (
 
 // StorageClass parameter keys for NFS configuration
 const (
-	paramNFSMountOptions = "nfs.mountOptions"
-	paramNFSHosts        = "nfs.hosts"
-	paramNFSNetworks     = "nfs.networks"
-	paramNFSMapAllUser   = "nfs.mapAllUser"
-	paramNFSMapAllGroup  = "nfs.mapAllGroup"
-	paramNFSRootSquash   = "nfs.rootSquash"
+	paramNFSMountOptions            = "nfs.mountOptions"
+	paramNFSHosts                   = "nfs.hosts"
+	paramNFSNetworks                = "nfs.networks"
+	paramNFSMapAllUser              = "nfs.mapAllUser"
+	paramNFSMapAllGroup             = "nfs.mapAllGroup"
+	paramNFSRootSquash              = "nfs.rootSquash"
+	paramNFSDatasetPermissionsMode  = "nfs.datasetPermissionsMode"
+	paramNFSDatasetPermissionsUser  = "nfs.datasetPermissionsUser"
+	paramNFSDatasetPermissionsGroup = "nfs.datasetPermissionsGroup"
 )
 
 // NFSHandler implements the ProtocolHandler interface for NFS volumes

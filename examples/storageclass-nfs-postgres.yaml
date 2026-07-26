@@ -1,0 +1,18 @@
+# StorageClass for PostgreSQL with mapall to a TrueNAS postgres user/group.
+# Requires a matching postgres user (and group) on TrueNAS (e.g. UID/GID 26).
+# Prefer storageclass-nfs-no-mapall.yaml or storageclass-nfs-fsgroup.yaml when you
+# cannot (or do not want to) create users on TrueNAS.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: truenas-csi-nfs-postgres
+provisioner: csi.truenas.io
+parameters:
+  protocol: "nfs"
+  pool: "tank"
+  compression: "LZ4"
+  nfs.mapAllUser: "postgres"
+  nfs.mapAllGroup: "postgres"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
