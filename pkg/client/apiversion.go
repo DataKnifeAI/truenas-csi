@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 )
 
 // MinAPIVersion is the minimum TrueNAS versioned API the driver requires.
