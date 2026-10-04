@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -23,6 +24,9 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/mount-utils"
 )
+
+// errInvalidVolumeID marks a volume ID that cannot name a TrueNAS dataset.
+var errInvalidVolumeID = errors.New("invalid volume ID")
 
 // DRIVER_VERSION is set at build time via ldflags.
 var DRIVER_VERSION = "dev"
@@ -700,7 +704,7 @@ func (d *Driver) unaryInterceptor(ctx context.Context, req any, info *grpc.Unary
 	connectedBefore := d.client.Connected()
 	resp, err := handler(ctx, req)
 	if err != nil && strings.HasPrefix(info.FullMethod, "/csi.v1.Controller/") {
-		err = d.unavailableIfDisconnected(err, connectedBefore)
+		err = d.unavailableIfTrueNASUnreachable(err, connectedBefore, startTime)
 	}
 
 	duration := time.Since(startTime)
@@ -716,12 +720,13 @@ func (d *Driver) unaryInterceptor(ctx context.Context, req any, info *grpc.Unary
 	return resp, err
 }
 
-// unavailableIfDisconnected reports a generic failure as Unavailable when the
-// TrueNAS connection was down at the start or end of the call. Handlers wrap
-// client errors as Internal, which external-provisioner treats as a final
+// unavailableIfTrueNASUnreachable reports a generic failure as Unavailable when
+// TrueNAS was unreachable during the call: disconnected at its start or end, or
+// a TrueNAS request timed out or lost its connection since it started. Handlers
+// wrap client errors as Internal, which external-provisioner treats as a final
 // failure; Unavailable tells the CO the failure is transient and to retry.
-func (d *Driver) unavailableIfDisconnected(err error, connectedBefore bool) error {
-	if connectedBefore && d.client.Connected() {
+func (d *Driver) unavailableIfTrueNASUnreachable(err error, connectedBefore bool, since time.Time) error {
+	if connectedBefore && d.client.Connected() && d.client.LastTransientFailure().Before(since) {
 		return err
 	}
 	st := status.Convert(err)
@@ -1208,7 +1213,7 @@ func (d *Driver) GetVolumeInfoWithContext(ctx context.Context, volumeID string) 
 func (d *Driver) reconstructVolumeFromTrueNAS(ctx context.Context, volumeID string) (*VolumeInfo, error) {
 	pool, datasetName, err := d.ParseVolumeID(volumeID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid volume ID %s: %w", volumeID, err)
+		return nil, fmt.Errorf("%w %s: %v", errInvalidVolumeID, volumeID, err)
 	}
 
 	datasetPath := pool + "/" + datasetName

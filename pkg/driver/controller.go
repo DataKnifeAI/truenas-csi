@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -198,6 +199,16 @@ func (s *ControllerServer) validateVolumeCapabilities(caps []*csi.VolumeCapabili
 		}
 	}
 	return nil
+}
+
+// volumeLookupError reports a failed volume lookup as NotFound only when the
+// volume is known not to exist. Sidecars treat NotFound as final, so any other
+// failure (for example a timeout while TrueNAS is stalled) must stay retryable.
+func volumeLookupError(volumeID string, err error) error {
+	if client.IsNotFoundError(err) || errors.Is(err, errInvalidVolumeID) {
+		return status.Errorf(codes.NotFound, "volume %s not found: %v", volumeID, err)
+	}
+	return status.Errorf(codes.Unavailable, "failed to look up volume %s: %v", volumeID, err)
 }
 
 // validateStorageClassParameters validates StorageClass parameters
@@ -1418,9 +1429,9 @@ func (s *ControllerServer) createVolumeFromSource(ctx context.Context, req *csi.
 			return nil, status.Error(codes.InvalidArgument, "source volume ID is required")
 		}
 
-		sourceInfo, err := s.driver.GetVolumeInfo(sourceVolume.VolumeId)
+		sourceInfo, err := s.driver.GetVolumeInfoWithContext(ctx, sourceVolume.VolumeId)
 		if err != nil {
-			return nil, status.Errorf(codes.NotFound, "source volume not found: %v", err)
+			return nil, volumeLookupError(sourceVolume.VolumeId, err)
 		}
 
 		sanitizedVolumeID := strings.ReplaceAll(volumeID, "/", "-")
@@ -1706,7 +1717,7 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	}
 
 	// Get volume info for resource cleanup
-	volInfo, _ := s.driver.GetVolumeInfo(req.VolumeId)
+	volInfo, _ := s.driver.GetVolumeInfoWithContext(ctx, req.VolumeId)
 
 	protocol := protocolUnknown
 	if volInfo != nil {
@@ -1815,7 +1826,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	// Check if volume exists by querying TrueNAS
 	dataset, err := s.driver.Client().GetDataset(ctx, datasetPath)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found: %v", req.VolumeId, err)
+		return nil, volumeLookupError(req.VolumeId, err)
 	}
 
 	// Validate volume capability
@@ -1827,7 +1838,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	publishContext := make(map[string]string)
 
 	// Try to get volume info from TrueNAS for complete publish context
-	volInfo, volInfoErr := s.driver.GetVolumeInfo(req.VolumeId)
+	volInfo, volInfoErr := s.driver.GetVolumeInfoWithContext(ctx, req.VolumeId)
 	if volInfoErr != nil {
 		s.driver.Log().Info("GetVolumeInfo failed", "volumeId", req.VolumeId, "error", volInfoErr)
 	} else if volInfo != nil {
@@ -1940,7 +1951,7 @@ func (s *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 	datasetPath := fmt.Sprintf("%s/%s", pool, name)
 	_, err = s.driver.Client().GetDataset(ctx, datasetPath)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume not found: %v", err)
+		return nil, volumeLookupError(req.VolumeId, err)
 	}
 
 	// Validate the requested capabilities
@@ -2066,9 +2077,9 @@ func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		return nil, status.Error(codes.InvalidArgument, "source volume ID is required")
 	}
 
-	volInfo, err := s.driver.GetVolumeInfo(req.SourceVolumeId)
+	volInfo, err := s.driver.GetVolumeInfoWithContext(ctx, req.SourceVolumeId)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume not found: %v", err)
+		return nil, volumeLookupError(req.SourceVolumeId, err)
 	}
 
 	defer func() { s.driver.metrics.RecordVolumeOperation(volInfo.Protocol, volumeOperationSnapshot, err) }()
@@ -2227,7 +2238,7 @@ func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 	if req.SourceVolumeId != "" {
 		// Try cache first, then parse volume ID directly
 		var datasetPath string
-		volInfo, err := s.driver.GetVolumeInfo(req.SourceVolumeId)
+		volInfo, err := s.driver.GetVolumeInfoWithContext(ctx, req.SourceVolumeId)
 		if err == nil {
 			datasetPath = volInfo.DatasetPath
 		} else {
@@ -2337,9 +2348,9 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
 	}
 
-	volInfo, err := s.driver.GetVolumeInfo(req.VolumeId)
+	volInfo, err := s.driver.GetVolumeInfoWithContext(ctx, req.VolumeId)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume not found: %v", err)
+		return nil, volumeLookupError(req.VolumeId, err)
 	}
 
 	defer func() { s.driver.metrics.RecordVolumeOperation(volInfo.Protocol, volumeOperationExpand, err) }()
@@ -2394,9 +2405,9 @@ func (s *ControllerServer) ControllerGetVolume(ctx context.Context, req *csi.Con
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
 	}
 
-	volInfo, err := s.driver.GetVolumeInfo(req.VolumeId)
+	volInfo, err := s.driver.GetVolumeInfoWithContext(ctx, req.VolumeId)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "volume not found: %v", err)
+		return nil, volumeLookupError(req.VolumeId, err)
 	}
 
 	dataset, err := s.driver.Client().GetDataset(ctx, volInfo.DatasetPath)

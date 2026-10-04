@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -175,4 +177,35 @@ func TestGetPool_NotFoundIsDetectable(t *testing.T) {
 	_, err := c.GetPool(testContext(t), "missing")
 	assertError(t, err)
 	assertTrue(t, IsNotFoundError(err))
+}
+
+func TestCall_TimeoutRecordsTransientFailure(t *testing.T) {
+	srv := newStallingServer(t)
+	c := newKeepaliveClient(srv.url, 100)
+	defer c.Close()
+	assertNoError(t, c.Connect(testContext(t)))
+	assertTrue(t, c.LastTransientFailure().IsZero())
+
+	srv.stalled.Store(true)
+	defer srv.stalled.Store(false)
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	assertError(t, c.Call(ctx, "pool.query", nil, nil))
+
+	assertTrue(t, c.Connected())
+	assertFalse(t, c.LastTransientFailure().Before(start))
+}
+
+func TestIsTransientError(t *testing.T) {
+	tests := []BoolTestCase{
+		{Name: "not connected", Input: ErrNotConnected, Expected: true},
+		{Name: "deadline", Input: fmt.Errorf("failed to get dataset: %w", context.DeadlineExceeded), Expected: true},
+		{Name: "connection error", Input: &ConnectionError{Op: "read", Err: errors.New("EOF")}, Expected: true},
+		{Name: "connection lost", Input: &RPCError{Code: rpcErrCodeConnectionLost, Message: connectionLostMessage}, Expected: true},
+		{Name: "TrueNAS error with code -1", Input: &RPCError{Code: -1, Message: "Authentication failed"}, Expected: false},
+		{Name: "not found", Input: fmt.Errorf("dataset x: %w", ErrNotFound), Expected: false},
+		{Name: "nil", Input: nil, Expected: false},
+	}
+	runBoolTableTests(t, tests, IsTransientError)
 }

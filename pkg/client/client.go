@@ -43,6 +43,7 @@ const (
 	// TrueNAS RPC error codes
 	rpcErrCodeNotFound       = -6 // ENOENT - resource not found
 	rpcErrCodeConnectionLost = -1 // Internal error for connection loss
+	connectionLostMessage    = "connection lost"
 
 	// TrueNAS reports method call errors with a generic JSON-RPC code and carries the
 	// real errno in the error's data, so an expired session is identified by these
@@ -206,6 +207,16 @@ func IsNotAuthenticatedError(err error) bool {
 	return strings.Contains(strings.ToUpper(rpcErr.Message), errnameNotAuthenticated)
 }
 
+// IsTransientError reports whether err means TrueNAS could not be reached or did
+// not answer in time, as opposed to TrueNAS rejecting the request.
+func IsTransientError(err error) bool {
+	if errors.Is(err, ErrNotConnected) || errors.Is(err, context.DeadlineExceeded) || IsConnectionError(err) {
+		return true
+	}
+	var rpcErr *RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == rpcErrCodeConnectionLost && rpcErr.Message == connectionLostMessage
+}
+
 // request represents a JSON-RPC request.
 type request struct {
 	ID      uint64 `json:"id"`
@@ -251,6 +262,11 @@ type Client struct {
 	// ReconnectMin, so a flapping appliance is not hammered with logins.
 	connectedAt        atomic.Int64
 	lastReconnectDelay atomic.Int64
+
+	// lastTransientFailure (unix nanos) is when a call last failed because
+	// TrueNAS was unreachable or did not answer in time. During a stall the
+	// connection stays up, so Connected alone does not reveal the outage.
+	lastTransientFailure atomic.Int64
 
 	// apiVersionPinned ensures the API version is resolved/verified only once.
 	apiVersionPinned atomic.Bool
@@ -526,6 +542,7 @@ func (c *Client) pingLoop(conn *websocket.Conn, done chan struct{}) {
 			// fresh connection would stall on authentication too, so only give up on
 			// the connection after several consecutive misses.
 			missed++
+			c.lastTransientFailure.Store(time.Now().UnixNano())
 			if errors.Is(err, context.DeadlineExceeded) && missed < c.config.PingFailureThreshold {
 				c.log.Info("TrueNAS ping timed out, keeping connection",
 					"error", err, "missedPings", missed, "threshold", c.config.PingFailureThreshold, "timeout", c.config.PingTimeout)
@@ -561,7 +578,7 @@ func (c *Client) handleDisconnect(conn *websocket.Conn) {
 	// Fail pending requests
 	c.pending.Range(func(key, value any) bool {
 		select {
-		case value.(chan response) <- response{Error: &RPCError{Code: rpcErrCodeConnectionLost, Message: "connection lost"}}:
+		case value.(chan response) <- response{Error: &RPCError{Code: rpcErrCodeConnectionLost, Message: connectionLostMessage}}:
 		default:
 		}
 		c.pending.Delete(key)
@@ -681,10 +698,22 @@ func (c *Client) Closed() bool {
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {
 	start := time.Now()
 	err := c.call(ctx, method, params, result)
+	if err != nil && IsTransientError(err) {
+		c.lastTransientFailure.Store(time.Now().UnixNano())
+	}
 	if c.config.CallObserver != nil {
 		c.config.CallObserver(method, time.Since(start), err)
 	}
 	return err
+}
+
+// LastTransientFailure returns when a call last failed because TrueNAS was
+// unreachable or did not answer in time, or the zero time if none has.
+func (c *Client) LastTransientFailure() time.Time {
+	if n := c.lastTransientFailure.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
 }
 
 // call invokes a JSON-RPC method with automatic retry on connection loss.

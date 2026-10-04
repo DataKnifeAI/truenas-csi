@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,9 +57,14 @@ func blackHoleURL(t *testing.T) string {
 }
 
 // fakeTrueNASURL returns a ws:// URL served by a minimal TrueNAS that accepts
-// any API key, knows the pool "tank" and rejects every other method.
-func fakeTrueNASURL(t *testing.T) string {
+// any API key, knows the pool "tank" and rejects every other method. behavior
+// overrides individual methods: "stall" does not answer until release is
+// called, "missing" answers with a does-not-exist error.
+func fakeTrueNASURL(t *testing.T, behavior map[string]string) (url string, release func()) {
 	t.Helper()
+	stalled := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(stalled) }) }
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/versions" {
 			_ = json.NewEncoder(w).Encode([]string{client.MinAPIVersion})
@@ -78,12 +84,17 @@ func fakeTrueNASURL(t *testing.T) string {
 				return
 			}
 			resp := map[string]any{"id": req.ID, "jsonrpc": "2.0"}
-			switch req.Method {
-			case "auth.login_with_api_key":
+			switch {
+			case behavior[req.Method] == "stall":
+				<-stalled
+				return
+			case behavior[req.Method] == "missing":
+				resp["error"] = map[string]any{"code": -32001, "message": "does not exist"}
+			case req.Method == "auth.login_with_api_key":
 				resp["result"] = true
-			case "core.ping":
+			case req.Method == "core.ping":
 				resp["result"] = "pong"
-			case "pool.query":
+			case req.Method == "pool.query":
 				resp["result"] = []map[string]any{{"id": 1, "name": "tank", "guid": "1"}}
 			default:
 				resp["error"] = map[string]any{"code": -32601, "message": "unsupported by fake"}
@@ -94,7 +105,25 @@ func fakeTrueNASURL(t *testing.T) string {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return "ws" + strings.TrimPrefix(srv.URL, "http")
+	t.Cleanup(release)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), release
+}
+
+// connectedTestDriver returns a driver whose client is connected to a fake TrueNAS.
+func connectedTestDriver(t *testing.T, behavior map[string]string) *Driver {
+	t.Helper()
+	url, release := fakeTrueNASURL(t, behavior)
+	d, _ := newTestDriver(t, url)
+	// Closing waits for the websocket close handshake, which a stalled server
+	// never completes.
+	t.Cleanup(func() {
+		release()
+		d.client.Close()
+	})
+	if err := d.client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect to fake TrueNAS: %v", err)
+	}
+	return d
 }
 
 func newTestDriver(t *testing.T, truenasURL string) (*Driver, string) {
@@ -197,7 +226,8 @@ func TestRun_ServesBeforeTrueNASResponds(t *testing.T) {
 }
 
 func TestRun_BackendReadyOnceTrueNASAnswers(t *testing.T) {
-	d, sock := newTestDriver(t, fakeTrueNASURL(t))
+	url, _ := fakeTrueNASURL(t, nil)
+	d, sock := newTestDriver(t, url)
 	runDriver(t, d, sock)
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -262,15 +292,10 @@ func TestInterceptor_TrueNASCallsUnavailableWhileDisconnected(t *testing.T) {
 	}
 }
 
-func TestUnavailableIfDisconnected(t *testing.T) {
+func TestUnavailableIfTrueNASUnreachable(t *testing.T) {
 	disconnected, _ := newTestDriver(t, blackHoleURL(t))
 	defer disconnected.client.Close()
-
-	connected, _ := newTestDriver(t, fakeTrueNASURL(t))
-	defer connected.client.Close()
-	if err := connected.client.Connect(context.Background()); err != nil {
-		t.Fatalf("connect to fake TrueNAS: %v", err)
-	}
+	connected := connectedTestDriver(t, nil)
 
 	internal := status.Error(codes.Internal, "boom")
 	tests := []struct {
@@ -287,9 +312,64 @@ func TestUnavailableIfDisconnected(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.d.unavailableIfDisconnected(tt.in, tt.d.client.Connected())
+			got := tt.d.unavailableIfTrueNASUnreachable(tt.in, tt.d.client.Connected(), time.Now())
 			if status.Code(got) != tt.want {
 				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// During a stall the connection stays up, so a call that timed out talking to
+// TrueNAS must still be reported as retryable.
+func TestUnavailableIfTrueNASUnreachable_StallWhileConnected(t *testing.T) {
+	d := connectedTestDriver(t, map[string]string{"pool.dataset.query": "stall"})
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = d.client.Call(ctx, "pool.dataset.query", nil, nil)
+
+	if !d.client.Connected() {
+		t.Fatal("test precondition: client must still be connected")
+	}
+	got := d.unavailableIfTrueNASUnreachable(status.Error(codes.Internal, "boom"), true, start)
+	if status.Code(got) != codes.Unavailable {
+		t.Fatalf("got %v, want Unavailable", got)
+	}
+}
+
+func TestControllerPublishVolume_LookupErrors(t *testing.T) {
+	req := &csi.ControllerPublishVolumeRequest{
+		VolumeId: "tank/pvc-1",
+		NodeId:   "node-1",
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		behavior string
+		want     codes.Code
+	}{
+		// The attacher treats NotFound as final; a stall must not look like a missing volume.
+		{"TrueNAS stalls", "stall", codes.Unavailable},
+		{"volume missing", "missing", codes.NotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := connectedTestDriver(t, map[string]string{"pool.dataset.get_instance": tt.behavior})
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+
+			_, err := d.unaryInterceptor(ctx, req, &grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ControllerPublishVolume"},
+				func(ctx context.Context, req any) (any, error) {
+					return d.controllerServer.ControllerPublishVolume(ctx, req.(*csi.ControllerPublishVolumeRequest))
+				})
+			if status.Code(err) != tt.want {
+				t.Fatalf("ControllerPublishVolume = %v, want %v", err, tt.want)
 			}
 		})
 	}
