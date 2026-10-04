@@ -3,7 +3,7 @@
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 1.1.2
+VERSION ?= 1.3.0
 
 # Git version information for ldflags injection
 GIT_VERSION := $(shell git describe --dirty --tags --always 2>/dev/null || echo "unknown")
@@ -114,8 +114,8 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 .PHONY: fmt
-fmt: ## Run go fmt against code.
-	go fmt ./...
+fmt: ## Run gofumpt against code (matches the formatter in .golangci.yml).
+	$(GOFUMPT) -l -w .
 
 .PHONY: vet
 vet: ## Run go vet against code.
@@ -270,6 +270,9 @@ ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 GOLANGCI_LINT_VERSION ?= v2.1.0
+# Keep in step with the root Makefile and the formatter in .golangci.yml.
+GOFUMPT_VERSION ?= v0.11.0
+GOFUMPT ?= go run mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.

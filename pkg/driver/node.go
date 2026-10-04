@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -13,6 +16,19 @@ import (
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 )
+
+const (
+	// Device path prefixes used to tell protocols apart from the mount table.
+	devicePrefixDev  = "/dev/"
+	devicePrefixNVMe = "/dev/nvme"
+
+	// statfsFlagReadOnly is ST_RDONLY from statfs(2), which the syscall package
+	// does not export.
+	statfsFlagReadOnly = 0x1
+)
+
+// statfs is syscall.Statfs; overridable in tests.
+var statfs = syscall.Statfs
 
 // NodeServer implements the CSI Node service
 type NodeServer struct {
@@ -97,16 +113,92 @@ func (s *NodeServer) getHandler(publishContext map[string]string) (ProtocolHandl
 }
 
 // handlerForVolume picks the protocol handler for Unstage/Expand, where no publish
-// context is available, by checking which connector file exists (NVMe first, then
-// iSCSI, defaulting to NFS).
-func (s *NodeServer) handlerForVolume(volumeID string) ProtocolHandler {
+// context is available. The connector file written at stage time is the primary
+// signal (NVMe first, then iSCSI).
+//
+// When no connector file exists the protocol is recovered from the mount at path.
+// Falling straight through to NFS is not safe: NFS Unstage is a no-op, so a block
+// volume whose connector file was lost would be reported as unstaged while its
+// staging mount and its session stayed in place, and the next stage would hand that
+// stale mount to workloads.
+func (s *NodeServer) handlerForVolume(volumeID, path string) ProtocolHandler {
 	if _, err := os.Stat(nvmeConnectorPath(volumeID)); err == nil {
 		return s.nvmeofHandler
 	}
 	if _, err := os.Stat(connectorPath(volumeID)); err == nil {
 		return s.iscsiHandler
 	}
+
+	if handler := s.handlerForMount(path); handler != nil {
+		s.driver.Log().Info("No connector file for volume, recovered the protocol from the mount",
+			"volumeId", volumeID, "path", path, "protocol", handler.Protocol())
+		return handler
+	}
+
+	s.driver.Log().V(LogLevelDebug).Info("No connector file and nothing mounted for volume, treating it as NFS",
+		"volumeId", volumeID, "path", path)
 	return s.nfsHandler
+}
+
+// handlerForMount identifies the protocol of whatever is mounted at path, or returns
+// nil when path is not mounted or the mount is not recognizable.
+func (s *NodeServer) handlerForMount(path string) ProtocolHandler {
+	if path == "" {
+		return nil
+	}
+
+	mounts, err := s.mounter.List()
+	if err != nil {
+		s.driver.Log().V(LogLevelDebug).Info("Failed to list mounts", "error", err)
+		return nil
+	}
+
+	// Paths can be mounted over; the last matching entry is the effective mount.
+	var handler ProtocolHandler
+	target := filepath.Clean(path)
+	for _, m := range mounts {
+		if filepath.Clean(m.Path) != target {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(m.Type, fsTypeNFS):
+			handler = s.nfsHandler
+		case strings.HasPrefix(m.Device, devicePrefixNVMe):
+			handler = s.nvmeofHandler
+		case strings.HasPrefix(m.Device, devicePrefixDev):
+			handler = s.iscsiHandler
+		}
+	}
+	return handler
+}
+
+// readOnlyRequested reports whether a volume capability asks for a read-only mount.
+func readOnlyRequested(capability *csi.VolumeCapability) bool {
+	switch capability.GetAccessMode().GetMode() {
+	case csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY:
+		return true
+	}
+	return slices.Contains(capability.GetMount().GetMountFlags(), mountOptionReadOnly)
+}
+
+// unusableStagedMountReason reports why the mount already present at the staging
+// path cannot be reused, or "" when it can be.
+//
+// A mount that outlives a storage-side interruption is left either unresponsive or
+// permanently read-only (ext4 aborts to read-only on I/O error). Repairing the
+// filesystem on the appliance does not help while that mount is still in place: the
+// staged filesystem is never re-read, so every pod bind-mounted onto it keeps
+// failing with EROFS. Such a mount is re-staged instead of being reused.
+func unusableStagedMountReason(path string, readOnly bool) string {
+	var stat syscall.Statfs_t
+	if err := statfs(path, &stat); err != nil {
+		return fmt.Sprintf("staged filesystem is not responding: %v", err)
+	}
+	if !readOnly && stat.Flags&statfsFlagReadOnly != 0 {
+		return "staged filesystem is mounted read-only but read-write access was requested"
+	}
+	return ""
 }
 
 // validateVolumeCapability checks if the requested capability is supported
@@ -155,17 +247,8 @@ func (s *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported volume capability: %v", err)
 	}
 
-	// Check if already staged (idempotency)
-	notMounted, err := s.mounter.IsLikelyNotMountPoint(req.StagingTargetPath)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, status.Errorf(codes.Internal, "failed to check staging path: %v", err)
-	}
-	if !notMounted {
-		s.driver.Log().V(LogLevelDebug).Info("Volume already staged", "volumeId", req.VolumeId, "stagingTargetPath", req.StagingTargetPath)
-		return &csi.NodeStageVolumeResponse{}, nil
-	}
-
-	// Acquire volume lock using volumeID-stagingPath combination
+	// Acquire volume lock using volumeID-stagingPath combination. Taken before the
+	// idempotency check below, which may have to tear a broken mount back down.
 	lockKey := fmt.Sprintf("%s-%s", req.VolumeId, req.StagingTargetPath)
 	if !s.TryAcquireLock(lockKey) {
 		return nil, status.Errorf(codes.Aborted, "operation already in progress for volume %s", req.VolumeId)
@@ -177,6 +260,28 @@ func (s *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	handler, err := s.getHandler(req.PublishContext)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to determine protocol: %v", err)
+	}
+
+	// Check if already staged (idempotency), but only reuse a mount that still
+	// works: a dead or read-only staging mount is silently inherited by every pod
+	// that publishes from it, so it is torn down and staged again instead.
+	notMounted, err := s.mounter.IsLikelyNotMountPoint(req.StagingTargetPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, status.Errorf(codes.Internal, "failed to check staging path: %v", err)
+	}
+	if !notMounted {
+		reason := unusableStagedMountReason(req.StagingTargetPath, readOnlyRequested(req.VolumeCapability))
+		if reason == "" {
+			s.driver.Log().V(LogLevelDebug).Info("Volume already staged", "volumeId", req.VolumeId, "stagingTargetPath", req.StagingTargetPath)
+			return &csi.NodeStageVolumeResponse{}, nil
+		}
+
+		s.driver.Log().Info("Existing staging mount is unusable, staging it again",
+			"volumeId", req.VolumeId, "stagingTargetPath", req.StagingTargetPath, "reason", reason)
+		unstageReq := &UnstageRequest{VolumeID: req.VolumeId, StagingPath: req.StagingTargetPath}
+		if err := handler.Unstage(ctx, unstageReq); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to release the unusable staging mount: %v", err)
+		}
 	}
 
 	// Check if this is a block volume request
@@ -232,8 +337,9 @@ func (s *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	}
 	defer s.ReleaseLock(lockKey)
 
-	// No publish context here — pick the handler from the connector file.
-	handler := s.handlerForVolume(req.VolumeId)
+	// No publish context here — pick the handler from the connector file, or from
+	// the staging mount itself when the connector file is gone.
+	handler := s.handlerForVolume(req.VolumeId, req.StagingTargetPath)
 
 	// Build unstage request
 	unstageReq := &UnstageRequest{
@@ -363,21 +469,21 @@ func (s *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-// NodeGetInfo returns the node ID and topology information.
+// NodeGetInfo returns the node ID.
+//
+// No accessible topology is reported. TrueNAS storage is network-attached and every
+// protocol the driver speaks (NFS, iSCSI, NVMe-oF) is reachable from any node with
+// network access, so there is no per-node locality to encode. Reporting a segment
+// only lets the provisioner stamp node affinity onto a PV, and since a node label
+// holds one value per key, any volume whose segment does not match what the nodes
+// happen to advertise becomes permanently unschedulable. The driver does not
+// advertise VOLUME_ACCESSIBILITY_CONSTRAINTS for the same reason.
 func (s *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	s.driver.Log().V(LogLevelDebug).Info("NodeGetInfo called")
 
 	return &csi.NodeGetInfoResponse{
 		NodeId: s.driver.NodeID(),
 		// MaxVolumesPerNode: 0 means no limit
-		// No pool-based topology: TrueNAS storage (NFS/iSCSI/NVMe-oF) is
-		// network-attached and reachable from every node, so volumes must not be
-		// constrained to a pool's node label. Only the per-node key is advertised.
-		AccessibleTopology: &csi.Topology{
-			Segments: map[string]string{
-				"topology.truenas.io/node": s.driver.NodeID(),
-			},
-		},
 	}, nil
 }
 
@@ -461,14 +567,15 @@ func (s *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		capacityBytes = req.CapacityRange.RequiredBytes
 	}
 
-	// No publish context here — pick the handler from the connector file
-	// (expansion is a no-op for NFS).
-	handler := s.handlerForVolume(req.VolumeId)
+	// No publish context here — pick the handler from the connector file, or from
+	// the mount itself when the connector file is gone (expansion is a no-op for NFS).
+	handler := s.handlerForVolume(req.VolumeId, req.VolumePath)
 
 	expandReq := &ExpandRequest{
 		VolumeID:      req.VolumeId,
 		VolumePath:    req.VolumePath,
 		CapacityBytes: capacityBytes,
+		IsBlockVolume: isBlockVolumeExpansion(req.VolumeCapability, req.VolumePath),
 	}
 
 	// Expand volume
@@ -478,6 +585,27 @@ func (s *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	}
 
 	return &csi.NodeExpandVolumeResponse{CapacityBytes: result.CapacityBytes}, nil
+}
+
+// isBlockVolumeExpansion reports whether the volume being expanded is a raw
+// block volume, which has no filesystem for the node to grow.
+//
+// The volume capability is optional on this RPC and cannot be relied on: a CO
+// may send only an access mode, or attach a mount access type whenever the
+// PersistentVolume names a filesystem, so an absent block access type does not
+// mean the volume has a filesystem. The volume path is the authoritative
+// signal, because block volumes are published as the device itself while
+// filesystem volumes are published as a directory.
+func isBlockVolumeExpansion(capability *csi.VolumeCapability, path string) bool {
+	if capability.GetBlock() != nil {
+		return true
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
 }
 
 type fsStats struct {
