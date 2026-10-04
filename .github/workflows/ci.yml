@@ -54,7 +54,11 @@ jobs:
             [ ! -d "$dir" ] && continue
             for file in $(find "$dir" \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null); do
               echo "Validating $file with kube-score"
-              if OUTPUT=$(kube-score score --ignore-test "$IGNORE_CHECKS" --ignore-test ingress-targets-service "$file" 2>&1); then
+              FILE_IGNORE="ingress-targets-service"
+              # The monitoring Services select pods defined in deploy/truenas-csi-driver.yaml,
+              # which kube-score cannot see when each file is scored on its own.
+              case "$file" in deploy/monitoring/*) FILE_IGNORE="$FILE_IGNORE,service-targets-pod" ;; esac
+              if OUTPUT=$(kube-score score --ignore-test "$IGNORE_CHECKS" --ignore-test "$FILE_IGNORE" "$file" 2>&1); then
                 echo "✅ $file passed"
                 echo "$OUTPUT" | head -15
               else
