@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,9 +21,12 @@ import (
 
 // Default configuration values
 const (
-	defaultCallTimeout           = 30 * time.Second
-	defaultPingInterval          = 30 * time.Second
-	defaultPingTimeout           = 10 * time.Second
+	defaultCallTimeout  = 30 * time.Second
+	defaultPingInterval = 30 * time.Second
+	// TrueNAS middlewared can stop answering for tens of seconds at a time while the
+	// socket stays healthy, so a short pong deadline drops connections needlessly.
+	defaultPingTimeout           = 30 * time.Second
+	defaultPingFailureThreshold  = 2
 	defaultDialTimeout           = 30 * time.Second
 	defaultTLSHandshakeTimeout   = 10 * time.Second
 	defaultReconnectMin          = 1 * time.Second
@@ -75,9 +79,17 @@ type Config struct {
 	InsecureSkipVerify bool
 	CallTimeout        time.Duration
 	PingInterval       time.Duration
-	ReconnectMin       time.Duration
-	ReconnectMax       time.Duration
-	ReconnectFactor    float64
+	// PingTimeout bounds how long a keepalive ping waits for its pong. 0 means 30s.
+	PingTimeout time.Duration
+	// PingFailureThreshold is how many consecutive keepalive pings may time out
+	// before the connection is treated as dead and re-established. 0 means 2.
+	PingFailureThreshold int
+	// DialTimeout bounds a single connection attempt, including authentication.
+	// 0 means 30s.
+	DialTimeout     time.Duration
+	ReconnectMin    time.Duration
+	ReconnectMax    time.Duration
+	ReconnectFactor float64
 	// MaxReconnectAttempts limits reconnection attempts. 0 means unlimited.
 	MaxReconnectAttempts int
 	// MaxConcurrentCalls limits the number of concurrent WebSocket API calls.
@@ -234,6 +246,12 @@ type Client struct {
 	// reconnects counts successful reconnections, for the driver's metrics.
 	reconnects atomic.Uint64
 
+	// connectedAt (unix nanos) and lastReconnectDelay let a connection that drops
+	// soon after being established keep backing off instead of restarting at
+	// ReconnectMin, so a flapping appliance is not hammered with logins.
+	connectedAt        atomic.Int64
+	lastReconnectDelay atomic.Int64
+
 	// apiVersionPinned ensures the API version is resolved/verified only once.
 	apiVersionPinned atomic.Bool
 
@@ -249,6 +267,15 @@ func New(cfg Config) *Client {
 	}
 	if cfg.PingInterval == 0 {
 		cfg.PingInterval = defaultPingInterval
+	}
+	if cfg.PingTimeout == 0 {
+		cfg.PingTimeout = defaultPingTimeout
+	}
+	if cfg.PingFailureThreshold <= 0 {
+		cfg.PingFailureThreshold = defaultPingFailureThreshold
+	}
+	if cfg.DialTimeout == 0 {
+		cfg.DialTimeout = defaultDialTimeout
 	}
 	if cfg.ReconnectMin == 0 {
 		cfg.ReconnectMin = defaultReconnectMin
@@ -302,6 +329,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
+	// A second dial alongside the reconnect loop would leave two live connections,
+	// one of them orphaned, so wait for the loop instead.
+	if c.reconnecting.Load() {
+		return c.waitForConnection(ctx)
+	}
+
 	err := c.dial(ctx)
 	if err == nil {
 		return nil
@@ -330,11 +363,11 @@ func (c *Client) dial(ctx context.Context) error {
 	// Add timeout if context has no deadline
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
+		ctx, cancel = context.WithTimeout(ctx, c.config.DialTimeout)
 		defer cancel()
 	}
 
-	c.log.Info("Connecting to TrueNAS", "url", c.config.URL, "timeout", defaultDialTimeout)
+	c.log.Info("Connecting to TrueNAS", "url", c.config.URL, "timeout", c.config.DialTimeout)
 
 	conn, _, err := websocket.Dial(ctx, c.config.URL, &websocket.DialOptions{
 		HTTPClient: &http.Client{
@@ -397,6 +430,7 @@ func (c *Client) dial(ctx context.Context) error {
 	c.conn = conn
 	c.connDone = connDone
 	c.connMu.Unlock()
+	c.connectedAt.Store(time.Now().UnixNano())
 
 	go c.readLoop(conn, connDone)
 	go c.pingLoop(conn, connDone)
@@ -453,6 +487,7 @@ func (c *Client) pingLoop(conn *websocket.Conn, done chan struct{}) {
 	ticker := time.NewTicker(c.config.PingInterval)
 	defer ticker.Stop()
 
+	missed := 0
 	for {
 		select {
 		case <-done:
@@ -462,11 +497,15 @@ func (c *Client) pingLoop(conn *websocket.Conn, done chan struct{}) {
 			// ping keeps the socket alive but never exercises the session, so an
 			// expired session would go unnoticed until a user request failed. This
 			// both keeps the session active and detects an expired one.
-			pingCtx, cancel := context.WithTimeout(context.Background(), defaultPingTimeout)
+			pingCtx, cancel := context.WithTimeout(context.Background(), c.config.PingTimeout)
 			err := c.callOn(pingCtx, conn, methodCorePing, nil, nil)
 			cancel()
 
 			if err == nil {
+				if missed > 0 {
+					c.log.Info("TrueNAS answered ping again, connection kept", "missedPings", missed)
+				}
+				missed = 0
 				c.log.V(logLevelDebug).Info("TrueNAS ping successful")
 				continue
 			}
@@ -479,9 +518,21 @@ func (c *Client) pingLoop(conn *websocket.Conn, done chan struct{}) {
 
 			if IsNotAuthenticatedError(err) {
 				c.log.Info("TrueNAS session is no longer authenticated, reconnecting to re-authenticate")
-			} else {
-				c.log.V(logLevelInfo).Info("TrueNAS ping failed - connection lost", "error", err)
+				c.handleDisconnect(conn)
+				return
 			}
+
+			// A late reply leaves the socket usable, and while middlewared is stalled a
+			// fresh connection would stall on authentication too, so only give up on
+			// the connection after several consecutive misses.
+			missed++
+			if errors.Is(err, context.DeadlineExceeded) && missed < c.config.PingFailureThreshold {
+				c.log.Info("TrueNAS ping timed out, keeping connection",
+					"error", err, "missedPings", missed, "threshold", c.config.PingFailureThreshold, "timeout", c.config.PingTimeout)
+				continue
+			}
+
+			c.log.Info("TrueNAS ping failed - connection lost", "error", err, "missedPings", missed)
 			c.handleDisconnect(conn)
 			return
 		}
@@ -534,7 +585,8 @@ func (c *Client) reconnectLoop() {
 		c.reconnecting.Store(false)
 	}()
 
-	delay := c.config.ReconnectMin
+	delay := c.firstReconnectDelay()
+	c.lastReconnectDelay.Store(int64(delay))
 	attempt := 0
 	maxAttempts := c.config.MaxReconnectAttempts
 
@@ -542,7 +594,7 @@ func (c *Client) reconnectLoop() {
 		select {
 		case <-c.done:
 			return
-		case <-time.After(delay):
+		case <-time.After(jitter(delay)):
 		}
 
 		if c.closed.Load() || c.Connected() {
@@ -563,7 +615,7 @@ func (c *Client) reconnectLoop() {
 			c.log.V(logLevelInfo).Info("TrueNAS reconnect attempt", "attempt", attempt)
 		}
 
-		dialCtx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
+		dialCtx, cancel := context.WithTimeout(context.Background(), c.config.DialTimeout)
 		err := c.dial(dialCtx)
 		cancel()
 
@@ -573,12 +625,35 @@ func (c *Client) reconnectLoop() {
 			return
 		}
 
-		c.log.V(logLevelInfo).Info("TrueNAS reconnect failed", "error", err)
-
 		// Exponential backoff
-		delay = time.Duration(float64(delay) * c.config.ReconnectFactor)
-		delay = min(delay, c.config.ReconnectMax)
+		delay = c.nextReconnectDelay(delay)
+		c.lastReconnectDelay.Store(int64(delay))
+		c.log.Info("TrueNAS reconnect failed", "error", err, "attempt", attempt, "retryIn", delay)
 	}
+}
+
+func (c *Client) nextReconnectDelay(delay time.Duration) time.Duration {
+	return min(time.Duration(float64(delay)*c.config.ReconnectFactor), c.config.ReconnectMax)
+}
+
+// firstReconnectDelay starts at ReconnectMin after a connection that stayed up for
+// at least ReconnectMax, and otherwise continues the previous backoff.
+func (c *Client) firstReconnectDelay() time.Duration {
+	prev := time.Duration(c.lastReconnectDelay.Load())
+	connectedAt := c.connectedAt.Load()
+	if prev == 0 || connectedAt == 0 || time.Since(time.Unix(0, connectedAt)) >= c.config.ReconnectMax {
+		return c.config.ReconnectMin
+	}
+	return c.nextReconnectDelay(prev)
+}
+
+// jitter spreads reconnects by +/-20% so several driver pods do not log in to
+// TrueNAS in lockstep after a shared outage.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
 }
 
 // Connected reports whether the client has an active connection.

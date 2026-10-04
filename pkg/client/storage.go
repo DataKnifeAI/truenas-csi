@@ -1298,7 +1298,7 @@ func (c *Client) GetPool(ctx context.Context, name string) (*Pool, error) {
 		return nil, fmt.Errorf("failed to query pool %s: %w", name, err)
 	}
 	if len(pools) == 0 {
-		return nil, fmt.Errorf("pool '%s' not found in TrueNAS", name)
+		return nil, fmt.Errorf("pool '%s' not found in TrueNAS: %w", name, ErrNotFound)
 	}
 	return &pools[0], nil
 }
