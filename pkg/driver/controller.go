@@ -211,6 +211,14 @@ func volumeLookupError(volumeID string, err error) error {
 	return status.Errorf(codes.Unavailable, "failed to look up volume %s: %v", volumeID, err)
 }
 
+// snapshotListError reports a failed snapshot query. Querying a dataset that
+// does not exist returns an empty list rather than an error, so a failure here
+// never means "no snapshots" and must not be answered with an empty list: the
+// snapshot controller would treat the snapshots as gone.
+func snapshotListError(target string, err error) error {
+	return status.Errorf(codes.Unavailable, "failed to list snapshots for %s: %v", target, err)
+}
+
 // validateStorageClassParameters validates StorageClass parameters
 func (s *ControllerServer) validateStorageClassParameters(ctx context.Context, parameters map[string]string) error {
 	// Validate compression algorithm
@@ -2201,9 +2209,7 @@ func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 
 			snapshots, err := s.driver.Client().ListSnapshots(ctx, datasetPath)
 			if err != nil {
-				// Return empty list if dataset doesn't exist
-				s.driver.Log().V(LogLevelDebug).Info("Failed to list snapshots for dataset", "dataset", datasetPath, "error", err)
-				return &csi.ListSnapshotsResponse{Entries: entries}, nil
+				return nil, snapshotListError("dataset "+datasetPath, err)
 			}
 
 			s.driver.Log().V(LogLevelDebug).Info("Looking for snapshot", "requestedId", req.SnapshotId, "datasetPath", datasetPath,
@@ -2239,9 +2245,12 @@ func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 		// Try cache first, then parse volume ID directly
 		var datasetPath string
 		volInfo, err := s.driver.GetVolumeInfoWithContext(ctx, req.SourceVolumeId)
-		if err == nil {
+		switch {
+		case err == nil:
 			datasetPath = volInfo.DatasetPath
-		} else {
+		case !client.IsNotFoundError(err) && !errors.Is(err, errInvalidVolumeID):
+			return nil, volumeLookupError(req.SourceVolumeId, err)
+		default:
 			// Volume not in cache - parse volume ID directly
 			pool, name, parseErr := s.driver.ParseVolumeID(req.SourceVolumeId)
 			if parseErr != nil {
@@ -2253,9 +2262,7 @@ func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 
 		snapshots, err := s.driver.Client().ListSnapshots(ctx, datasetPath)
 		if err != nil {
-			// Return empty list if dataset doesn't exist
-			s.driver.Log().V(LogLevelDebug).Info("Failed to list snapshots for volume", "volumeId", req.SourceVolumeId, "error", err)
-			return &csi.ListSnapshotsResponse{Entries: entries}, nil
+			return nil, snapshotListError("volume "+req.SourceVolumeId, err)
 		}
 
 		// Apply pagination
@@ -2290,8 +2297,7 @@ func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 	s.driver.Log().V(LogLevelDebug).Info("Listing all snapshots")
 	allSnapshots, err := s.driver.Client().ListAllSnapshots(ctx)
 	if err != nil {
-		s.driver.Log().V(LogLevelDebug).Info("Failed to list all snapshots", "error", err)
-		return &csi.ListSnapshotsResponse{Entries: entries}, nil
+		return nil, snapshotListError("all volumes", err)
 	}
 
 	// Apply pagination

@@ -90,6 +90,8 @@ func fakeTrueNASURL(t *testing.T, behavior map[string]string) (url string, relea
 				return
 			case behavior[req.Method] == "missing":
 				resp["error"] = map[string]any{"code": -32001, "message": "does not exist"}
+			case behavior[req.Method] == "empty":
+				resp["result"] = []any{}
 			case req.Method == "auth.login_with_api_key":
 				resp["result"] = true
 			case req.Method == "core.ping":
@@ -370,6 +372,72 @@ func TestControllerPublishVolume_LookupErrors(t *testing.T) {
 				})
 			if status.Code(err) != tt.want {
 				t.Fatalf("ControllerPublishVolume = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestListSnapshots_LookupErrors(t *testing.T) {
+	const (
+		datasetGet    = "pool.dataset.get_instance"
+		snapshotQuery = "pool.snapshot.query"
+	)
+	tests := []struct {
+		name     string
+		req      *csi.ListSnapshotsRequest
+		behavior map[string]string
+		want     codes.Code
+	}{
+		// An empty list tells the snapshot controller the snapshots are gone,
+		// so a stalled TrueNAS must produce an error instead.
+		{
+			"by snapshot ID, query stalls", &csi.ListSnapshotsRequest{SnapshotId: "tank/pvc-1@snap-1"},
+			map[string]string{snapshotQuery: "stall"},
+			codes.Unavailable,
+		},
+		{
+			"by source volume, lookup stalls", &csi.ListSnapshotsRequest{SourceVolumeId: "tank/pvc-1"},
+			map[string]string{datasetGet: "stall"},
+			codes.Unavailable,
+		},
+		{
+			"by source volume, query stalls", &csi.ListSnapshotsRequest{SourceVolumeId: "tank/pvc-1"},
+			map[string]string{datasetGet: "missing", snapshotQuery: "stall"},
+			codes.Unavailable,
+		},
+		{
+			"all snapshots, query stalls", &csi.ListSnapshotsRequest{},
+			map[string]string{snapshotQuery: "stall"},
+			codes.Unavailable,
+		},
+		{
+			"by source volume, volume missing", &csi.ListSnapshotsRequest{SourceVolumeId: "tank/pvc-1"},
+			map[string]string{datasetGet: "missing", snapshotQuery: "empty"},
+			codes.OK,
+		},
+		{
+			"by snapshot ID, no snapshots", &csi.ListSnapshotsRequest{SnapshotId: "tank/pvc-1@snap-1"},
+			map[string]string{snapshotQuery: "empty"},
+			codes.OK,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := connectedTestDriver(t, tt.behavior)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+
+			resp, err := d.unaryInterceptor(ctx, tt.req, &grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ListSnapshots"},
+				func(ctx context.Context, req any) (any, error) {
+					return d.controllerServer.ListSnapshots(ctx, req.(*csi.ListSnapshotsRequest))
+				})
+			if status.Code(err) != tt.want {
+				t.Fatalf("ListSnapshots = %v, want %v", err, tt.want)
+			}
+			if tt.want == codes.OK {
+				if entries := resp.(*csi.ListSnapshotsResponse).Entries; len(entries) != 0 {
+					t.Fatalf("ListSnapshots returned %d entries, want none", len(entries))
+				}
 			}
 		})
 	}
