@@ -49,18 +49,21 @@ func (s *IdentityServer) GetPluginCapabilities(ctx context.Context, req *csi.Get
 	}, nil
 }
 
-// Probe checks if the driver is healthy.
-// Returns success whenever the driver process is alive (prevents liveness probe kills
-// during temporary TrueNAS disconnections). The Ready field indicates whether the
-// backend is actually reachable — false means the client is reconnecting.
+// Probe reports whether the plugin is serving. It reports ready whenever the
+// gRPC server answers, regardless of TrueNAS connectivity: the livenessprobe
+// sidecar turns Ready=false into a failed liveness check, and restarting the
+// plugin cannot make an unresponsive TrueNAS API respond. TrueNAS-backed calls
+// return Unavailable while the API is unreachable, and connection changes are
+// logged by the client.
 func (s *IdentityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
-	s.driver.Log().V(LogLevelDebug).Info("Probe called")
+	s.driver.Log().V(LogLevelDebug).Info("Probe called",
+		"truenasConnected", s.driver.client.Connected(), "backendReady", s.driver.BackendReady())
 
 	if s.driver.client.Closed() {
-		return nil, status.Error(codes.FailedPrecondition, "TrueNAS client closed")
+		return nil, status.Error(codes.FailedPrecondition, "driver is shutting down")
 	}
 
 	return &csi.ProbeResponse{
-		Ready: &wrapperspb.BoolValue{Value: s.driver.client.Connected()},
+		Ready: &wrapperspb.BoolValue{Value: true},
 	}, nil
 }

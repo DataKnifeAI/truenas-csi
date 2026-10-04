@@ -446,6 +446,9 @@ func TestNew_DefaultConfig(t *testing.T) {
 	// Verify defaults are applied
 	assertEqual(t, client.config.CallTimeout, defaultCallTimeout)
 	assertEqual(t, client.config.PingInterval, defaultPingInterval)
+	assertEqual(t, client.config.PingTimeout, 30*time.Second)
+	assertEqual(t, client.config.PingFailureThreshold, 2)
+	assertEqual(t, client.config.DialTimeout, defaultDialTimeout)
 	assertEqual(t, client.config.ReconnectMin, defaultReconnectMin)
 	assertEqual(t, client.config.ReconnectMax, defaultReconnectMax)
 	assertEqual(t, client.config.ReconnectFactor, defaultReconnectFactor)

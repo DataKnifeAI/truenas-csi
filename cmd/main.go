@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/truenas/truenas-csi/pkg/driver"
 	"k8s.io/klog/v2/textlogger"
@@ -158,6 +159,34 @@ func loadEnvConfig(config *driver.DriverConfig) error {
 	// variable but exits on an unknown flag.
 	if config.MetricsAddr == "" {
 		config.MetricsAddr = os.Getenv("TRUENAS_METRICS_ADDR")
+	}
+
+	// Optional TrueNAS connection tuning; unset keeps the client defaults.
+	for _, d := range []struct {
+		env string
+		dst *time.Duration
+	}{
+		{"TRUENAS_PING_INTERVAL", &config.PingInterval},
+		{"TRUENAS_PING_TIMEOUT", &config.PingTimeout},
+		{"TRUENAS_DIAL_TIMEOUT", &config.DialTimeout},
+	} {
+		val := os.Getenv(d.env)
+		if val == "" {
+			continue
+		}
+		parsed, err := time.ParseDuration(val)
+		if err != nil || parsed <= 0 {
+			return fmt.Errorf("%s must be a positive duration such as 30s, got %q", d.env, val)
+		}
+		*d.dst = parsed
+	}
+
+	if val := os.Getenv("TRUENAS_PING_FAILURE_THRESHOLD"); val != "" {
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 1 {
+			return fmt.Errorf("TRUENAS_PING_FAILURE_THRESHOLD must be a positive integer, got %q", val)
+		}
+		config.PingFailureThreshold = n
 	}
 
 	return nil
