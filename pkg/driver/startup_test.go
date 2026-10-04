@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,8 +60,17 @@ func blackHoleURL(t *testing.T) string {
 // fakeTrueNASURL returns a ws:// URL served by a minimal TrueNAS that accepts
 // any API key, knows the pool "tank" and rejects every other method. behavior
 // overrides individual methods: "stall" does not answer until release is
-// called, "missing" answers with a does-not-exist error.
+// called, "missing" answers with a does-not-exist error, "empty" with an empty
+// list, and "slow-empty" and "slow-port" with an empty list or an NVMe/TCP port
+// after a delay.
 func fakeTrueNASURL(t *testing.T, behavior map[string]string) (url string, release func()) {
+	t.Helper()
+	return fakeTrueNASServer(t, behavior, nil)
+}
+
+// fakeTrueNASServer is fakeTrueNASURL with onCall, if non-nil, invoked with the
+// method of every request.
+func fakeTrueNASServer(t *testing.T, behavior map[string]string, onCall func(method string)) (url string, release func()) {
 	t.Helper()
 	stalled := make(chan struct{})
 	var once sync.Once
@@ -83,8 +93,17 @@ func fakeTrueNASURL(t *testing.T, behavior map[string]string) (url string, relea
 			if err := wsjson.Read(r.Context(), conn, &req); err != nil {
 				return
 			}
+			if onCall != nil {
+				onCall(req.Method)
+			}
 			resp := map[string]any{"id": req.ID, "jsonrpc": "2.0"}
 			switch {
+			case behavior[req.Method] == "slow-empty":
+				time.Sleep(100 * time.Millisecond)
+				resp["result"] = []any{}
+			case behavior[req.Method] == "slow-port":
+				time.Sleep(100 * time.Millisecond)
+				resp["result"] = map[string]any{"id": 7, "addr_trtype": client.NVMeTransportTCP}
 			case behavior[req.Method] == "stall":
 				<-stalled
 				return
@@ -440,5 +459,73 @@ func TestListSnapshots_LookupErrors(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// RPCs are served while the startup initializer resolves the NVMe-oF port, so
+// concurrent lookups must not each create a shared port.
+func TestNVMeOFPortID_ConcurrentCallersCreateOnePort(t *testing.T) {
+	var creates atomic.Int32
+	url, release := fakeTrueNASServer(t, map[string]string{
+		"nvmet.port.query":  "slow-empty",
+		"nvmet.port.create": "slow-port",
+	}, func(method string) {
+		if method == "nvmet.port.create" {
+			creates.Add(1)
+		}
+	})
+	d, _ := newTestDriver(t, url)
+	t.Cleanup(func() {
+		release()
+		d.client.Close()
+	})
+	if err := d.client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect to fake TrueNAS: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const callers = 4
+	ids := make([]int, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids[i], errs[i] = d.NVMeOFPortID(ctx)
+		}()
+	}
+	wg.Wait()
+
+	for i := range callers {
+		if errs[i] != nil || ids[i] != 7 {
+			t.Errorf("caller %d: NVMeOFPortID = %d, %v; want 7, nil", i, ids[i], errs[i])
+		}
+	}
+	if n := creates.Load(); n != 1 {
+		t.Fatalf("created %d NVMe-oF ports, want 1", n)
+	}
+}
+
+// A caller waiting on another caller's lookup still honours its own deadline,
+// so a CreateVolume cannot be held past it by a stalled startup lookup.
+func TestNVMeOFPortID_WaiterHonoursItsDeadline(t *testing.T) {
+	d := connectedTestDriver(t, map[string]string{"nvmet.port.query": "stall"})
+
+	first, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	go func() { _, _ = d.NVMeOFPortID(first) }()
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := d.NVMeOFPortID(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("NVMeOFPortID = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("NVMeOFPortID returned after %v, want it to stop at its 100ms deadline", elapsed)
 	}
 }

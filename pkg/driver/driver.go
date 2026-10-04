@@ -19,6 +19,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-logr/logr"
 	"github.com/truenas/truenas-csi/pkg/client"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -237,6 +238,9 @@ type Driver struct {
 	// global base NQN (informational).
 	nvmeofPortID int
 	nvmeBaseNQN  string
+	// nvmePortResolve collapses concurrent NVMeOFPortID lookups into one, so
+	// the startup initializer and RPC handlers cannot each create a port.
+	nvmePortResolve singleflight.Group
 
 	// backendReady is set once TrueNAS has been reached and the default pool
 	// verified after startup.
@@ -542,8 +546,8 @@ func (d *Driver) resolveApplianceSettings(ctx context.Context) {
 		}
 	}
 
-	// Resolving the NVMe-oF port up front avoids a create race between
-	// concurrent CreateVolume calls.
+	// Resolve the NVMe-oF port up front so the first CreateVolume does not
+	// have to; NVMeOFPortID collapses concurrent lookups into one.
 	if d.nvmeofPortal != "" {
 		if _, err := d.NVMeOFPortID(ctx); err != nil {
 			d.log.V(LogLevelInfo).Info("Failed to resolve/create NVMe-oF port, will retry on first use", "portal", d.nvmeofPortal, "error", err)
@@ -1011,16 +1015,33 @@ func (d *Driver) NVMeOFPortID(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("NVMe-oF portal is not configured (set TRUENAS_NVMEOF_PORTAL)")
 	}
 
-	host, port := splitNVMeOFPortal(d.nvmeofPortal)
-	created, err := resolveOrCreateNVMePort(ctx, d.client, host, port)
-	if err != nil {
-		return 0, err
+	ch := d.nvmePortResolve.DoChan("nvme-port", func() (any, error) {
+		d.cacheMu.Lock()
+		cached := d.nvmeofPortID
+		d.cacheMu.Unlock()
+		if cached > 0 {
+			return cached, nil
+		}
+		host, port := splitNVMeOFPortal(d.nvmeofPortal)
+		created, err := resolveOrCreateNVMePort(ctx, d.client, host, port)
+		if err != nil {
+			return 0, err
+		}
+		d.cacheMu.Lock()
+		d.nvmeofPortID = created.ID
+		d.cacheMu.Unlock()
+		d.log.V(LogLevelInfo).Info("Resolved NVMe-oF port ID", "portal", d.nvmeofPortal, "portID", created.ID)
+		return created.ID, nil
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return 0, res.Err
+		}
+		return res.Val.(int), nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
 	}
-	d.cacheMu.Lock()
-	d.nvmeofPortID = created.ID
-	d.cacheMu.Unlock()
-	d.log.V(LogLevelInfo).Info("Resolved NVMe-oF port ID", "portal", d.nvmeofPortal, "portID", created.ID)
-	return created.ID, nil
 }
 
 // splitNVMeOFPortal splits a "host:port" portal into host and numeric port,
