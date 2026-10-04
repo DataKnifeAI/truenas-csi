@@ -225,7 +225,12 @@ func (s *ControllerServer) validateStorageClassParameters(ctx context.Context, p
 	// Validate pool exists
 	if pool, ok := parameters[paramPool]; ok {
 		if _, err := s.driver.Client().GetPool(ctx, pool); err != nil {
-			return fmt.Errorf("pool %s does not exist or is not accessible", pool)
+			if client.IsNotFoundError(err) {
+				return fmt.Errorf("pool %s does not exist", pool)
+			}
+			// Not a parameter problem: the lookup itself failed (e.g. TrueNAS is
+			// unreachable), so the caller must be able to retry.
+			return status.Errorf(codes.Unavailable, "could not verify pool %s: %v", pool, err)
 		}
 	}
 
@@ -360,6 +365,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	// Validate StorageClass parameters
 	if err := s.validateStorageClassParameters(ctx, parameters); err != nil {
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.InvalidArgument, "invalid storage class parameters: %v", err)
 	}
 

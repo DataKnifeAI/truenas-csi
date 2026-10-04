@@ -19,6 +19,8 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/truenas/truenas-csi/pkg/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/mount-utils"
 )
 
@@ -212,22 +214,29 @@ type Driver struct {
 	log    logr.Logger
 	client *client.Client
 
-	defaultPool   string
-	nfsServer     string
-	iscsiPortal   string
+	defaultPool  string
+	nfsServer    string
+	iscsiPortal  string
+	iscsiIQNBase string
+	nvmeofPortal string
+
+	// cacheMu guards the values below, which are read from TrueNAS in the
+	// background after startup and lazily by RPC handlers.
+	cacheMu       sync.Mutex
 	iscsiPortalID int
-	iscsiIQNBase  string
 	// iscsiBasename is the appliance's iSCSI global basename, read from TrueNAS
 	// and cached. TrueNAS advertises every target as <basename>:<target-name>, so
 	// this is authoritative over iscsiIQNBase (which is only a fallback). Empty
 	// until resolved (see resolveISCSIBasename).
 	iscsiBasename string
-
-	// NVMe-oF portal (host:port for the NVMe/TCP listener) and the resolved
-	// shared port ID. nvmeBaseNQN is TrueNAS's global base NQN (informational).
-	nvmeofPortal string
+	// nvmeofPortID is the shared NVMe/TCP port ID; nvmeBaseNQN is TrueNAS's
+	// global base NQN (informational).
 	nvmeofPortID int
 	nvmeBaseNQN  string
+
+	// backendReady is set once TrueNAS has been reached and the default pool
+	// verified after startup.
+	backendReady atomic.Bool
 
 	identityServer   csi.IdentityServer
 	controllerServer csi.ControllerServer
@@ -288,14 +297,20 @@ type DriverConfig struct {
 	// ":8080"). Empty leaves the endpoint disabled.
 	MetricsAddr string
 
+	// TrueNAS connection tuning. Zero values use the client defaults.
+	PingInterval         time.Duration
+	PingTimeout          time.Duration
+	PingFailureThreshold int
+	DialTimeout          time.Duration
+
 	// Logger is the structured logger for the driver and client.
 	// If not set, logging for the client will be disabled.
 	Logger logr.Logger
 }
 
 // NewDriver creates a new TrueNAS CSI driver with the given configuration.
-// It validates the configuration, establishes a connection to TrueNAS,
-// and initializes the controller and node services.
+// It validates the configuration and initializes the controller and node
+// services. It does not contact TrueNAS; Run does that in the background.
 func NewDriver(config *DriverConfig) (*Driver, error) {
 	if config.DriverName == "" {
 		config.DriverName = DRIVER_NAME
@@ -366,96 +381,25 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 		}
 	}
 
-	ctx := context.Background()
-
 	// Built before the client so API calls are observed from the first one.
 	metrics := NewMetrics()
 
 	cfg := client.Config{
-		URL:                config.TrueNASURL,
-		APIKey:             config.TrueNASAPIKey,
-		InsecureSkipVerify: config.TrueNASInsecure,
-		Logger:             config.Logger,
-		CallObserver:       metrics.RecordAPICall,
+		URL:                  config.TrueNASURL,
+		APIKey:               config.TrueNASAPIKey,
+		InsecureSkipVerify:   config.TrueNASInsecure,
+		PingInterval:         config.PingInterval,
+		PingTimeout:          config.PingTimeout,
+		PingFailureThreshold: config.PingFailureThreshold,
+		DialTimeout:          config.DialTimeout,
+		Logger:               config.Logger,
+		CallObserver:         metrics.RecordAPICall,
 	}
 
+	// The client connects in the background once Run is serving (see initBackend):
+	// connecting here would keep the CSI socket from existing for as long as
+	// TrueNAS is unresponsive, and the liveness probe would restart the container.
 	truenasClient := client.New(cfg)
-	if err := truenasClient.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("failed to connect to TrueNAS: %w", err)
-	}
-
-	// Test connection
-	if err := truenasClient.Ping(ctx); err != nil {
-		truenasClient.Close()
-		return nil, fmt.Errorf("failed to ping TrueNAS: %w", err)
-	}
-
-	// Validate that the default pool exists
-	log.V(LogLevelInfo).Info("Validating pool exists in TrueNAS", "pool", config.DefaultPool)
-	pool, err := truenasClient.GetPool(ctx, config.DefaultPool)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate pool '%s': %w\n\nPlease create the pool in TrueNAS UI (Storage → Create Pool) before using the CSI driver", config.DefaultPool, err)
-	}
-	log.V(LogLevelInfo).Info("Pool validated successfully", "pool", config.DefaultPool, "guid", pool.GUID)
-
-	// Resolve iSCSI portal ID from TrueNAS (if iSCSI portal is configured)
-	var iscsiPortalID int
-	if config.ISCSIPortal != "" {
-		portalHost, _, err := net.SplitHostPort(config.ISCSIPortal)
-		if err != nil {
-			// No port specified, use the whole string as the host
-			portalHost = config.ISCSIPortal
-		}
-		portal, err := truenasClient.GetISCSIPortalByAddress(ctx, portalHost)
-		if err != nil {
-			log.V(LogLevelInfo).Info("Failed to resolve iSCSI portal ID, will retry on first use", "portal", config.ISCSIPortal, "error", err)
-		} else if portal != nil {
-			iscsiPortalID = portal.ID
-			log.V(LogLevelInfo).Info("Resolved iSCSI portal ID", "portal", config.ISCSIPortal, "portalID", iscsiPortalID)
-		} else {
-			log.V(LogLevelInfo).Info("No iSCSI portal found matching address, will retry on first use", "address", portalHost)
-		}
-	}
-
-	// Resolve-or-create the shared NVMe-oF TCP port and cache the global base NQN.
-	// Done once at startup (like the iSCSI portal) to avoid a create race between
-	// concurrent CreateVolume calls. Failures are non-fatal: the port is resolved
-	// lazily on first use (NVMeOFPortID) if NVMe-oF volumes are requested.
-	var nvmeofPortID int
-	if config.NVMeOFPortal != "" {
-		portalHost, portalPort := splitNVMeOFPortal(config.NVMeOFPortal)
-		if port, err := resolveOrCreateNVMePort(ctx, truenasClient, portalHost, portalPort); err != nil {
-			log.V(LogLevelInfo).Info("Failed to resolve/create NVMe-oF port, will retry on first use", "portal", config.NVMeOFPortal, "error", err)
-		} else {
-			nvmeofPortID = port.ID
-			log.V(LogLevelInfo).Info("Resolved NVMe-oF port ID", "portal", config.NVMeOFPortal, "portID", nvmeofPortID)
-		}
-	}
-
-	var nvmeBaseNQN string
-	if gc, err := truenasClient.GetNVMeGlobalConfig(ctx); err != nil {
-		log.V(LogLevelInfo).Info("Failed to read nvmet global config", "error", err)
-	} else {
-		nvmeBaseNQN = gc.BaseNQN
-		log.V(LogLevelInfo).Info("Read nvmet base NQN", "baseNQN", nvmeBaseNQN)
-	}
-
-	// Read the appliance's iSCSI global basename. TrueNAS advertises every target
-	// as <basename>:<target-name>, so this value — not the configured IQN base —
-	// is what the node must log in against. Failures are non-fatal: it is resolved
-	// lazily on first use (resolveISCSIBasename).
-	var iscsiBasename string
-	if gc, err := truenasClient.GetISCSIGlobalConfig(ctx); err != nil {
-		log.V(LogLevelInfo).Info("Failed to read iSCSI global config, will retry on first use", "configuredBase", config.ISCSIIQNBase, "error", err)
-	} else if gc.Basename != "" {
-		iscsiBasename = gc.Basename
-		if config.ISCSIIQNBase != "" && config.ISCSIIQNBase != gc.Basename {
-			log.Info("Configured iSCSI IQN base differs from the TrueNAS appliance basename; the appliance value will be used",
-				"configured", config.ISCSIIQNBase, "appliance", gc.Basename)
-		} else {
-			log.V(LogLevelInfo).Info("Read iSCSI global basename", "basename", gc.Basename)
-		}
-	}
 
 	// Default to "all" mode if not specified
 	mode := config.Mode
@@ -466,23 +410,19 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 	log.V(LogLevelInfo).Info("Initializing driver", "mode", mode)
 
 	d := &Driver{
-		name:          config.DriverName,
-		version:       config.DriverVersion,
-		nodeID:        config.NodeID,
-		endpoint:      config.Endpoint,
-		log:           log,
-		client:        truenasClient,
-		defaultPool:   config.DefaultPool,
-		nfsServer:     config.NFSServer,
-		iscsiPortal:   config.ISCSIPortal,
-		iscsiPortalID: iscsiPortalID,
-		iscsiIQNBase:  config.ISCSIIQNBase,
-		iscsiBasename: iscsiBasename,
-		nvmeofPortal:  config.NVMeOFPortal,
-		nvmeofPortID:  nvmeofPortID,
-		nvmeBaseNQN:   nvmeBaseNQN,
-		metrics:       metrics,
-		metricsAddr:   config.MetricsAddr,
+		name:         config.DriverName,
+		version:      config.DriverVersion,
+		nodeID:       config.NodeID,
+		endpoint:     config.Endpoint,
+		log:          log,
+		client:       truenasClient,
+		defaultPool:  config.DefaultPool,
+		nfsServer:    config.NFSServer,
+		iscsiPortal:  config.ISCSIPortal,
+		iscsiIQNBase: config.ISCSIIQNBase,
+		nvmeofPortal: config.NVMeOFPortal,
+		metrics:      metrics,
+		metricsAddr:  config.MetricsAddr,
 	}
 
 	if err := d.metrics.RegisterConnectionState(truenasClient.Connected, truenasClient.Reconnects); err != nil {
@@ -519,8 +459,116 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 	return d, nil
 }
 
-// Run starts the CSI driver gRPC server on the configured endpoint.
-// It blocks until the server is stopped or an error occurs.
+const (
+	backendInitRetryMin = 2 * time.Second
+	backendInitRetryMax = 2 * time.Minute
+	backendCheckTimeout = 2 * time.Minute
+)
+
+// initBackend connects to TrueNAS, verifies the default pool and caches the
+// appliance settings the driver needs, retrying with backoff until it succeeds
+// or ctx is done. Failures, including rejected credentials or a missing pool,
+// are logged rather than fatal: exiting would only crash-loop the plugin, and
+// node operations that do not need the TrueNAS API (NFS mounts and unmounts)
+// keep working meanwhile. Calls that need TrueNAS return Unavailable until then.
+func (d *Driver) initBackend(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			d.log.Error(nil, "Recovered from panic in TrueNAS backend initialization", "panic", r)
+		}
+	}()
+
+	delay := backendInitRetryMin
+	for attempt := 1; ; attempt++ {
+		err := d.checkBackend(ctx)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil || d.client.Closed() {
+			return
+		}
+		d.log.Error(err, "TrueNAS backend not usable yet; the CSI endpoint stays up and TrueNAS-backed calls return Unavailable until it is",
+			"attempt", attempt, "retryIn", delay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, backendInitRetryMax)
+	}
+
+	d.backendReady.Store(true)
+	d.log.Info("TrueNAS backend ready", "pool", d.defaultPool)
+	d.resolveApplianceSettings(ctx)
+}
+
+// checkBackend connects to TrueNAS (waiting out transient connection failures)
+// and verifies the default pool exists.
+func (d *Driver) checkBackend(ctx context.Context) error {
+	if err := d.client.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to connect to TrueNAS: %w", err)
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, backendCheckTimeout)
+	defer cancel()
+
+	if err := d.client.Ping(checkCtx); err != nil {
+		return fmt.Errorf("failed to ping TrueNAS: %w", err)
+	}
+
+	d.log.V(LogLevelInfo).Info("Validating pool exists in TrueNAS", "pool", d.defaultPool)
+	pool, err := d.client.GetPool(checkCtx, d.defaultPool)
+	if err != nil {
+		return fmt.Errorf("failed to validate pool '%s': %w\n\nPlease create the pool in TrueNAS UI (Storage → Create Pool) before using the CSI driver", d.defaultPool, err)
+	}
+	d.log.V(LogLevelInfo).Info("Pool validated successfully", "pool", d.defaultPool, "guid", pool.GUID)
+	return nil
+}
+
+// resolveApplianceSettings reads and caches the iSCSI portal ID, the shared
+// NVMe-oF port, the nvmet base NQN and the iSCSI basename. Each is optional here
+// and resolved again lazily on first use if this fails.
+func (d *Driver) resolveApplianceSettings(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, backendCheckTimeout)
+	defer cancel()
+
+	if d.iscsiPortal != "" {
+		if _, err := d.ISCSIPortalID(ctx); err != nil {
+			d.log.V(LogLevelInfo).Info("Failed to resolve iSCSI portal ID, will retry on first use", "portal", d.iscsiPortal, "error", err)
+		}
+	}
+
+	// Resolving the NVMe-oF port up front avoids a create race between
+	// concurrent CreateVolume calls.
+	if d.nvmeofPortal != "" {
+		if _, err := d.NVMeOFPortID(ctx); err != nil {
+			d.log.V(LogLevelInfo).Info("Failed to resolve/create NVMe-oF port, will retry on first use", "portal", d.nvmeofPortal, "error", err)
+		}
+	}
+
+	if gc, err := d.client.GetNVMeGlobalConfig(ctx); err != nil {
+		d.log.V(LogLevelInfo).Info("Failed to read nvmet global config", "error", err)
+	} else {
+		d.cacheMu.Lock()
+		d.nvmeBaseNQN = gc.BaseNQN
+		d.cacheMu.Unlock()
+		d.log.V(LogLevelInfo).Info("Read nvmet base NQN", "baseNQN", gc.BaseNQN)
+	}
+
+	if basename := d.resolveISCSIBasename(ctx); basename != "" {
+		d.log.V(LogLevelInfo).Info("Read iSCSI global basename", "basename", basename)
+	}
+}
+
+// BackendReady reports whether TrueNAS has been reached and the default pool
+// verified since startup.
+func (d *Driver) BackendReady() bool {
+	return d.backendReady.Load()
+}
+
+// Run starts the CSI driver gRPC server on the configured endpoint and then
+// connects to TrueNAS in the background. It blocks until the server is stopped
+// or an error occurs.
 func (d *Driver) Run(ctx context.Context) error {
 	defer func() {
 		if r := recover(); r != nil {
@@ -595,6 +643,8 @@ func (d *Driver) Run(ctx context.Context) error {
 		}
 	}()
 
+	go d.initBackend(ctx)
+
 	select {
 	case <-ctx.Done():
 		d.log.V(LogLevelInfo).Info("Shutdown signal received, stopping CSI driver")
@@ -647,7 +697,11 @@ func (d *Driver) unaryInterceptor(ctx context.Context, req any, info *grpc.Unary
 	d.log.V(LogLevelDebug).Info("GRPC call started", "method", info.FullMethod, "requestId", requestID)
 	d.log.V(LogLevelTrace).Info("GRPC request", "method", info.FullMethod, "requestId", requestID, "request", sanitizeRequest(req))
 
+	connectedBefore := d.client.Connected()
 	resp, err := handler(ctx, req)
+	if err != nil && strings.HasPrefix(info.FullMethod, "/csi.v1.Controller/") {
+		err = d.unavailableIfDisconnected(err, connectedBefore)
+	}
 
 	duration := time.Since(startTime)
 	d.metrics.RecordGRPCCall(info.FullMethod, err, duration)
@@ -660,6 +714,22 @@ func (d *Driver) unaryInterceptor(ctx context.Context, req any, info *grpc.Unary
 	}
 
 	return resp, err
+}
+
+// unavailableIfDisconnected reports a generic failure as Unavailable when the
+// TrueNAS connection was down at the start or end of the call. Handlers wrap
+// client errors as Internal, which external-provisioner treats as a final
+// failure; Unavailable tells the CO the failure is transient and to retry.
+func (d *Driver) unavailableIfDisconnected(err error, connectedBefore bool) error {
+	if connectedBefore && d.client.Connected() {
+		return err
+	}
+	st := status.Convert(err)
+	switch st.Code() {
+	case codes.Internal, codes.Unknown:
+		return status.Errorf(codes.Unavailable, "TrueNAS API unavailable: %s", st.Message())
+	}
+	return err
 }
 
 // sanitizeRequest removes sensitive data from requests before logging.
@@ -875,8 +945,11 @@ func (d *Driver) ISCSIPortal() string {
 // ISCSIPortalID returns the resolved TrueNAS portal ID for iSCSI target creation.
 // If the portal ID was not resolved at startup, it attempts lazy resolution.
 func (d *Driver) ISCSIPortalID(ctx context.Context) (int, error) {
-	if d.iscsiPortalID > 0 {
-		return d.iscsiPortalID, nil
+	d.cacheMu.Lock()
+	cached := d.iscsiPortalID
+	d.cacheMu.Unlock()
+	if cached > 0 {
+		return cached, nil
 	}
 
 	if d.iscsiPortal == "" {
@@ -896,9 +969,11 @@ func (d *Driver) ISCSIPortalID(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("no iSCSI portal found matching address %q — create one in TrueNAS UI (Shares → iSCSI → Portals)", portalHost)
 	}
 
+	d.cacheMu.Lock()
 	d.iscsiPortalID = portal.ID
-	d.log.V(LogLevelInfo).Info("Resolved iSCSI portal ID", "portal", d.iscsiPortal, "portalID", d.iscsiPortalID)
-	return d.iscsiPortalID, nil
+	d.cacheMu.Unlock()
+	d.log.V(LogLevelInfo).Info("Resolved iSCSI portal ID", "portal", d.iscsiPortal, "portalID", portal.ID)
+	return portal.ID, nil
 }
 
 // NVMeOFPortal returns the configured NVMe-oF portal address (host:port).
@@ -921,8 +996,11 @@ func (d *Driver) NVMeOFPortSvcID() int {
 // NVMeOFPortID returns the resolved TrueNAS nvmet port ID for the shared NVMe/TCP
 // listener. If it was not resolved at startup, it resolves-or-creates it lazily.
 func (d *Driver) NVMeOFPortID(ctx context.Context) (int, error) {
-	if d.nvmeofPortID > 0 {
-		return d.nvmeofPortID, nil
+	d.cacheMu.Lock()
+	cached := d.nvmeofPortID
+	d.cacheMu.Unlock()
+	if cached > 0 {
+		return cached, nil
 	}
 	if d.nvmeofPortal == "" {
 		return 0, fmt.Errorf("NVMe-oF portal is not configured (set TRUENAS_NVMEOF_PORTAL)")
@@ -933,9 +1011,11 @@ func (d *Driver) NVMeOFPortID(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	d.cacheMu.Lock()
 	d.nvmeofPortID = created.ID
-	d.log.V(LogLevelInfo).Info("Resolved NVMe-oF port ID", "portal", d.nvmeofPortal, "portID", d.nvmeofPortID)
-	return d.nvmeofPortID, nil
+	d.cacheMu.Unlock()
+	d.log.V(LogLevelInfo).Info("Resolved NVMe-oF port ID", "portal", d.nvmeofPortal, "portID", created.ID)
+	return created.ID, nil
 }
 
 // splitNVMeOFPortal splits a "host:port" portal into host and numeric port,
@@ -979,8 +1059,11 @@ func (d *Driver) DefaultPool() string {
 // been resolved (the startup read failed and this retry also failed), signalling
 // callers to fall back to the configured IQN base.
 func (d *Driver) resolveISCSIBasename(ctx context.Context) string {
-	if d.iscsiBasename != "" {
-		return d.iscsiBasename
+	d.cacheMu.Lock()
+	cached := d.iscsiBasename
+	d.cacheMu.Unlock()
+	if cached != "" {
+		return cached
 	}
 	gc, err := d.client.GetISCSIGlobalConfig(ctx)
 	if err != nil || gc == nil || gc.Basename == "" {
@@ -993,8 +1076,10 @@ func (d *Driver) resolveISCSIBasename(ctx context.Context) string {
 		d.log.Info("Configured iSCSI IQN base differs from the TrueNAS appliance basename; the appliance value will be used",
 			"configured", d.iscsiIQNBase, "appliance", gc.Basename)
 	}
+	d.cacheMu.Lock()
 	d.iscsiBasename = gc.Basename
-	return d.iscsiBasename
+	d.cacheMu.Unlock()
+	return gc.Basename
 }
 
 // ControllerCaps returns the controller capabilities
