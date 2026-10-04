@@ -51,6 +51,10 @@ const (
 // handlerForVolume for the recovery path). Overridable in tests.
 var connectorDir = "/var/lib/truenas-csi/connectors"
 
+// loadISCSIConnector reads an iSCSI connector file. The library resolves the
+// recorded devices with lsblk on the host, so tests replace it.
+var loadISCSIConnector = iscsilib.GetConnectorFromFile
+
 // ISCSIHandler implements the ProtocolHandler interface for iSCSI volumes
 type ISCSIHandler struct {
 	mounter *mount.SafeFormatAndMount
@@ -309,7 +313,7 @@ func (h *ISCSIHandler) cleanupISCSISession(volumeID string) error {
 	// Try to load connector - GetConnectorFromFile may fail validation if
 	// mountTargetDevice is nil, but we only need TargetIqn and TargetPortals
 	// for disconnect, so try to read the file directly as fallback
-	connector, err := iscsilib.GetConnectorFromFile(cpath)
+	connector, err := loadISCSIConnector(cpath)
 	if err != nil {
 		h.log.V(LogLevelDebug).Info("GetConnectorFromFile failed, trying direct read", "path", cpath, "error", err)
 		// Read file directly and unmarshal to get IQN and portals
@@ -430,7 +434,7 @@ func (h *ISCSIHandler) Publish(ctx context.Context, req *PublishRequest) error {
 func (h *ISCSIHandler) publishBlockVolume(ctx context.Context, req *PublishRequest) error {
 	// Get device path from connector file
 	cpath := connectorPath(req.VolumeID)
-	connector, err := iscsilib.GetConnectorFromFile(cpath)
+	connector, err := loadISCSIConnector(cpath)
 	if err != nil {
 		return fmt.Errorf("failed to load connector for block volume: %w", err)
 	}
@@ -516,7 +520,7 @@ func (h *ISCSIHandler) Expand(ctx context.Context, req *ExpandRequest) (*ExpandR
 
 	// Load connector to get device info
 	cpath := connectorPath(req.VolumeID)
-	connector, err := iscsilib.GetConnectorFromFile(cpath)
+	connector, err := loadISCSIConnector(cpath)
 	if err != nil {
 		h.log.Info("Failed to load connector for expand", "error", err)
 	}

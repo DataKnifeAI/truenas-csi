@@ -10,6 +10,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-logr/logr"
+	iscsilib "github.com/kubernetes-csi/csi-lib-iscsi/iscsi"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
@@ -30,6 +31,25 @@ func partitionTableExec() *testingexec.FakeExec {
 			func(name string, args ...string) exec.Cmd { return testingexec.InitFakeCmd(cmd, name, args...) },
 		},
 	}
+}
+
+// stubISCSIConnectorLoader reads connector files without resolving their devices
+// through lsblk, which only succeeds on hosts that happen to have the recorded device.
+func stubISCSIConnectorLoader(t *testing.T) {
+	t.Helper()
+	orig := loadISCSIConnector
+	loadISCSIConnector = func(path string) (*iscsilib.Connector, error) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		var c iscsilib.Connector
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil, err
+		}
+		return &c, nil
+	}
+	t.Cleanup(func() { loadISCSIConnector = orig })
 }
 
 // A raw block volume is published as the device itself, and the volume capability on
@@ -93,6 +113,7 @@ func TestIsBlockVolumeExpansion(t *testing.T) {
 // expansion never completes and the pod cannot map the device again.
 func TestISCSIExpand_BlockVolumeSkipsFilesystemResize(t *testing.T) {
 	dir := useTempConnectorDir(t)
+	stubISCSIConnectorLoader(t)
 	const volumeID = "tank/pvc-abc"
 
 	cpath := filepath.Join(dir, sanitizeISCSIVolumeID(volumeID)+".connector")
@@ -132,6 +153,7 @@ func TestISCSIExpand_BlockVolumeSkipsFilesystemResize(t *testing.T) {
 // one: reporting success would leave the filesystem short of the expanded device.
 func TestISCSIExpand_FilesystemVolumeStillResizes(t *testing.T) {
 	dir := useTempConnectorDir(t)
+	stubISCSIConnectorLoader(t)
 	const volumeID = "tank/pvc-abc"
 
 	cpath := filepath.Join(dir, sanitizeISCSIVolumeID(volumeID)+".connector")
