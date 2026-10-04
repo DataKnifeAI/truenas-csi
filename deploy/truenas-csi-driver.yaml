@@ -164,6 +164,12 @@ data:
   iscsiPortal: "YOUR-TRUENAS-IP:3260"
   nvmeofPortal: "YOUR-TRUENAS-IP:4420"  # Optional: NVMe-oF portal; auto-derived from truenasURL host if omitted
   iscsiIQNBase: "iqn.2000-01.io.truenas"  # Optional: Custom IQN prefix (default: iqn.2000-01.io.truenas)
+  # Optional: Prometheus metrics. Uncomment to serve /metrics on this address in
+  # the controller, then apply deploy/monitoring/. Disabled while absent.
+  # metricsAddr: ":8080"
+  # Optional: the same for the node plugin, which runs with hostNetwork, so the
+  # address it binds is a port on every node. See docs/metrics.md.
+  # nodeMetricsAddr: ":8080"
 
 ---
 # Controller Deployment
@@ -240,6 +246,13 @@ spec:
                   name: truenas-csi-config
                   key: truenasInsecure
                   optional: true
+            # Prometheus metrics listen address, disabled when the key is absent
+            - name: TRUENAS_METRICS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: truenas-csi-config
+                  key: metricsAddr
+                  optional: true
             - name: NODE_ID
               valueFrom:
                 fieldRef:
@@ -269,11 +282,15 @@ spec:
           args:
             - "--csi-address=$(ADDRESS)"
             - "--v=5"
-            - "--feature-gates=Topology=true"
+            # No Topology feature gate: the driver reports no accessible topology,
+            # so there is nothing for the provisioner to constrain PVs by.
             - "--extra-create-metadata"
             - "--leader-election=true"
             - "--default-fstype=ext4"
             - "--timeout=60s"
+            # Sidecar metrics (csi_sidecar_operations_seconds). Each sidecar in
+            # this pod needs its own port; see docs/metrics.md for the map.
+            - "--http-endpoint=:8081"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -289,6 +306,7 @@ spec:
             - "--v=5"
             - "--leader-election=true"
             - "--timeout=60s"
+            - "--http-endpoint=:8082"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -304,6 +322,7 @@ spec:
             - "--v=5"
             - "--leader-election=true"
             - "--timeout=60s"
+            - "--http-endpoint=:8083"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -319,6 +338,7 @@ spec:
             - "--v=5"
             - "--leader-election=true"
             - "--timeout=60s"
+            - "--http-endpoint=:8084"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -371,7 +391,14 @@ spec:
           lifecycle:
             postStart:
               exec:
-                command: ["/bin/sh", "-c", "mkdir -p /run/lock/iscsi && mv /usr/sbin/iscsiadm /usr/sbin/iscsiadm.orig 2>/dev/null; printf '#!/bin/sh\\nnsenter --mount=/host/proc/1/ns/mnt -- /usr/sbin/iscsiadm \"$@\"\\n' > /usr/sbin/iscsiadm && chmod +x /usr/sbin/iscsiadm; nsenter --mount=/host/proc/1/ns/mnt -- modprobe nvme_tcp 2>/dev/null || true; nsenter --mount=/host/proc/1/ns/mnt -- modprobe nvme_fabrics 2>/dev/null || true; test -x /usr/sbin/iscsiadm"]
+                # The shim replaces the container's bundled iscsiadm and re-execs the
+                # host's copy in the host mount namespace. The host binary is looked
+                # up on PATH, not at an absolute path: distributions disagree on where
+                # iscsiadm lives (/usr/sbin on Debian and RHEL, /usr/local/sbin on
+                # Talos), and naming a path makes execvp skip the search and fail with
+                # a bare exit 127. The modprobes are non-fatal because NVMe-oF is
+                # optional, so the hook's verdict is gated on the shim instead.
+                command: ["/bin/sh", "-c", "mkdir -p /run/lock/iscsi && mv /usr/sbin/iscsiadm /usr/sbin/iscsiadm.orig 2>/dev/null; printf '#!/bin/sh\\nexport PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\\nexec nsenter --mount=/host/proc/1/ns/mnt -- iscsiadm \"$@\"\\n' > /usr/sbin/iscsiadm && chmod +x /usr/sbin/iscsiadm; nsenter --mount=/host/proc/1/ns/mnt -- modprobe nvme_tcp 2>/dev/null || true; nsenter --mount=/host/proc/1/ns/mnt -- modprobe nvme_fabrics 2>/dev/null || true; test -x /usr/sbin/iscsiadm"]
           securityContext:
             privileged: true
           args:
@@ -426,6 +453,15 @@ spec:
                   name: truenas-csi-config
                   key: truenasInsecure
                   optional: true
+            # Prometheus metrics listen address. This pod runs with hostNetwork,
+            # so its key is deliberately separate from the controller's: setting
+            # it opens the port on every node.
+            - name: TRUENAS_METRICS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: truenas-csi-config
+                  key: nodeMetricsAddr
+                  optional: true
             - name: NODE_ID
               valueFrom:
                 fieldRef:
@@ -447,6 +483,8 @@ spec:
             - name: iscsi-lib
               mountPath: /var/lib/iscsi
               mountPropagation: Bidirectional
+            - name: connector-dir
+              mountPath: /var/lib/truenas-csi
             - name: host-root
               mountPath: /host
               mountPropagation: Bidirectional
@@ -521,6 +559,13 @@ spec:
         - name: iscsi-lib
           hostPath:
             path: /var/lib/iscsi
+            type: DirectoryOrCreate
+        # Per-volume connector files record the protocol and target of each staged
+        # volume. NodeUnstageVolume gets no publish context, so this state has to
+        # outlive the container.
+        - name: connector-dir
+          hostPath:
+            path: /var/lib/truenas-csi
             type: DirectoryOrCreate
         - name: host-root
           hostPath:

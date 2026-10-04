@@ -15,6 +15,7 @@ A Container Storage Interface (CSI) driver for [TrueNAS 25.10.0+](https://www.tr
 - **ZFS encryption** - Dataset-level encryption with key management
 - **Automatic snapshot scheduling** - Periodic snapshots via StorageClass
 - **TrueNAS Websocket API** - Uses the modern TrueNAS Websocket API
+- **Prometheus metrics** - Optional `/metrics` endpoint for CSI operations and TrueNAS API health ([docs](docs/metrics.md))
 
 ## Requirements
 
@@ -72,6 +73,21 @@ kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snaps
 
 ### Deploy the Driver
 
+Either install path works; they deploy the same objects.
+
+**Helm** ([chart reference](charts/truenas-csi/README.md)):
+```bash
+helm repo add truenas-csi https://raw.githubusercontent.com/truenas/truenas-csi/master/charts
+helm install truenas-csi truenas-csi/truenas-csi \
+  --namespace truenas-csi --create-namespace \
+  --set truenas.url=wss://YOUR-TRUENAS-IP \
+  --set truenas.apiKey=YOUR-API-KEY \
+  --set truenas.defaultPool=tank \
+  --set truenas.insecureSkipTLS=true
+```
+
+**Manifest:**
+
 1. Edit `deploy/truenas-csi-driver.yaml` with your configuration
 2. Apply the manifest:
    ```bash
@@ -100,8 +116,8 @@ The default deployment manifest uses `/var/lib/kubelet` as the kubelet root dire
 | Distribution | Kubelet Path |
 |---|---|
 | Standard Kubernetes | `/var/lib/kubelet` (default) |
+| K3s | `/var/lib/kubelet` |
 | MicroK8s | `/var/snap/microk8s/common/var/lib/kubelet` |
-| K3s | `/var/lib/rancher/k3s/agent/kubelet` |
 
 > **Important:** The `kubelet-dir` `mountPath` must match the `hostPath`. If they differ, NFS mounts will succeed inside the CSI container but will not propagate to kubelet, causing pods to see local storage instead of NFS.
 
@@ -136,6 +152,10 @@ sudo systemctl enable microk8s-mount-propagation
 
 ## Configuration
 
+The settings below are the ConfigMap keys used by `deploy/truenas-csi-driver.yaml`.
+With Helm they are set through values instead; see the
+[chart reference](charts/truenas-csi/README.md) for the mapping.
+
 ### Driver Configuration (ConfigMap)
 
 | Setting | Description | Example |
@@ -147,6 +167,8 @@ sudo systemctl enable microk8s-mount-propagation
 | `iscsiPortal` | iSCSI portal address | `10.0.0.100:3260` |
 | `nvmeofPortal` | NVMe-oF portal address (optional; auto-derived) | `10.0.0.100:4420` |
 | `iscsiIQNBase` | Base IQN for iSCSI targets | `iqn.2024-01.com.example` |
+| `metricsAddr` | Prometheus metrics address for the controller (optional; disabled when absent) | `:8080` |
+| `nodeMetricsAddr` | Prometheus metrics address for the node plugin, which uses hostNetwork (optional) | `:8080` |
 
 ### StorageClass Parameters
 

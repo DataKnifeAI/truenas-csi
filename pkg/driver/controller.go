@@ -303,8 +303,28 @@ func (s *ControllerServer) validateStorageClassParameters(ctx context.Context, p
 	return nil
 }
 
+// idempotentVolumeResponse builds the CreateVolume response for a volume that
+// already exists.
+//
+// The requested content source is echoed back. The external-provisioner rejects a
+// source-backed request answered without one and calls DeleteVolume to clean up, so
+// omitting it destroys the very clone the CO just asked for, mid-publish. The source
+// is taken from the request rather than read back from the dataset's ZFS origin:
+// provisioned names are generated per PVC, so the same name is never reused for a
+// different source, and a promoted or copy-restored dataset has no origin to compare.
+func idempotentVolumeResponse(volumeID string, capacityBytes int64, volumeContext map[string]string, source *csi.VolumeContentSource) *csi.CreateVolumeResponse {
+	return &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			VolumeId:      volumeID,
+			CapacityBytes: capacityBytes,
+			VolumeContext: volumeContext,
+			ContentSource: source,
+		},
+	}
+}
+
 // CreateVolume creates a new volume on TrueNAS, either as an NFS share or iSCSI target.
-func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (resp *csi.CreateVolumeResponse, err error) {
 	ctx, cancel := withTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 
@@ -346,12 +366,23 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	protocol := s.driver.GetProtocolFromParameters(parameters)
 	pool := s.driver.GetPoolFromParameters(parameters)
 
+	defer func() { s.driver.metrics.RecordVolumeOperation(protocol, volumeOperationCreate, err) }()
+
 	volumeName := SanitizeVolumeName(req.Name)
 	datasetPath := pool + "/" + volumeName
 	if dsPath, ok := parameters[paramDatasetPath]; ok && dsPath != "" {
 		datasetPath = pool + "/" + dsPath + "/" + volumeName
 	}
 	volumeID := datasetPath
+
+	// Check block volume compatibility with protocol (NFS cannot back raw block).
+	// This validates the request, so it runs before the idempotency check below,
+	// which would otherwise answer an invalid request with a success.
+	for _, cap := range req.VolumeCapabilities {
+		if cap.GetBlock() != nil && protocol != ProtocolISCSI && protocol != ProtocolNVMeOF {
+			return nil, status.Error(codes.InvalidArgument, "block volume mode is not supported for NFS protocol")
+		}
+	}
 
 	existingDataset, err := s.driver.Client().GetDataset(ctx, datasetPath)
 	if err == nil && existingDataset != nil {
@@ -387,55 +418,26 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			returnedCapacity = requiredBytes
 		}
 
-		// For iSCSI ZVOLs, ensure the full iSCSI chain (target/extent/targetextent) exists.
-		// A previous CreateVolume may have created the ZVOL but failed before completing
-		// the iSCSI setup (e.g., due to a WebSocket connection drop).
-		if existingDataset.Type == datasetTypeVolume && protocol == ProtocolISCSI {
-			volCtx, err := s.ensureISCSIChain(ctx, volumeID, datasetPath, parameters)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to ensure iSCSI resources for existing volume: %v", err)
+		// For ZVOL-backed volumes, ensure the full protocol chain exists (iSCSI
+		// target/extent/targetextent, or NVMe-oF subsystem/namespace). A previous
+		// CreateVolume may have created the ZVOL but failed before completing that
+		// setup (e.g., due to a WebSocket connection drop).
+		volumeContext := parameters
+		if existingDataset.Type == datasetTypeVolume {
+			switch protocol {
+			case ProtocolISCSI:
+				volumeContext, err = s.ensureISCSIChain(ctx, volumeID, datasetPath, parameters)
+			case ProtocolNVMeOF:
+				volumeContext, err = s.ensureNVMeOFChain(ctx, volumeID, datasetPath, parameters)
 			}
-			s.driver.Log().V(LogLevelDebug).Info("Volume already exists, returning with iSCSI context", "volumeId", volumeID, "capacity", returnedCapacity)
-			return &csi.CreateVolumeResponse{
-				Volume: &csi.Volume{
-					VolumeId:      volumeID,
-					CapacityBytes: returnedCapacity,
-					VolumeContext: volCtx,
-				},
-			}, nil
-		}
-
-		// Same idempotent-repair for NVMe-oF ZVOLs.
-		if existingDataset.Type == datasetTypeVolume && protocol == ProtocolNVMeOF {
-			volCtx, err := s.ensureNVMeOFChain(ctx, volumeID, datasetPath, parameters)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to ensure NVMe-oF resources for existing volume: %v", err)
+				return nil, status.Errorf(codes.Internal, "failed to ensure %s resources for existing volume: %v", protocol, err)
 			}
-			s.driver.Log().V(LogLevelDebug).Info("Volume already exists, returning with NVMe-oF context", "volumeId", volumeID, "capacity", returnedCapacity)
-			return &csi.CreateVolumeResponse{
-				Volume: &csi.Volume{
-					VolumeId:      volumeID,
-					CapacityBytes: returnedCapacity,
-					VolumeContext: volCtx,
-				},
-			}, nil
 		}
 
-		s.driver.Log().V(LogLevelDebug).Info("Volume already exists, returning existing volume", "volumeId", volumeID, "capacity", returnedCapacity)
-		return &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      volumeID,
-				CapacityBytes: returnedCapacity,
-				VolumeContext: parameters,
-			},
-		}, nil
-	}
-
-	// Check block volume compatibility with protocol (NFS cannot back raw block)
-	for _, cap := range req.VolumeCapabilities {
-		if cap.GetBlock() != nil && protocol != ProtocolISCSI && protocol != ProtocolNVMeOF {
-			return nil, status.Error(codes.InvalidArgument, "block volume mode is not supported for NFS protocol")
-		}
+		s.driver.Log().V(LogLevelDebug).Info("Volume already exists, returning existing volume",
+			"volumeId", volumeID, "capacity", returnedCapacity, "protocol", protocol)
+		return idempotentVolumeResponse(volumeID, returnedCapacity, volumeContext, req.VolumeContentSource), nil
 	}
 
 	if req.VolumeContentSource != nil {
@@ -456,7 +458,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Errorf(codes.Internal, "failed to create volume: %v", err)
 	}
 
-	resp := &csi.CreateVolumeResponse{
+	resp = &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      volInfo.ID,
 			CapacityBytes: volInfo.CapacityBytes,
@@ -1326,48 +1328,6 @@ func (s *ControllerServer) createVolumeFromSource(ctx context.Context, req *csi.
 	s.driver.Log().V(LogLevelDebug).Info("Creating volume from content source", "volumeId", volumeID)
 	contentSource := req.VolumeContentSource
 
-	// Idempotency check: if the target dataset already exists, return it
-	existingDataset, err := s.driver.Client().GetDataset(ctx, datasetPath)
-	if err == nil && existingDataset != nil {
-		s.driver.Log().V(LogLevelDebug).Info("Volume from content source already exists", "volumeId", volumeID)
-		capacityBytes := existingDataset.RefQuota
-		if isZVOLProtocol(protocol) && existingDataset.Volsize > 0 {
-			capacityBytes = existingDataset.Volsize
-		}
-
-		// For ZVOL-backed clones, ensure the full protocol chain exists. A previous
-		// CreateVolume may have cloned the ZVOL but failed before completing the
-		// iSCSI target/extent or NVMe-oF subsystem/namespace setup.
-		if existingDataset.Type == datasetTypeVolume && isZVOLProtocol(protocol) {
-			var volCtx map[string]string
-			if protocol == ProtocolNVMeOF {
-				volCtx, err = s.ensureNVMeOFChain(ctx, volumeID, datasetPath, parameters)
-			} else {
-				volCtx, err = s.ensureISCSIChain(ctx, volumeID, datasetPath, parameters)
-			}
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to ensure resources for existing clone: %v", err)
-			}
-			return &csi.CreateVolumeResponse{
-				Volume: &csi.Volume{
-					VolumeId:      volumeID,
-					CapacityBytes: capacityBytes,
-					VolumeContext: volCtx,
-					ContentSource: contentSource,
-				},
-			}, nil
-		}
-
-		return &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      volumeID,
-				CapacityBytes: capacityBytes,
-				VolumeContext: parameters,
-				ContentSource: contentSource,
-			},
-		}, nil
-	}
-
 	switch {
 	case contentSource.GetSnapshot() != nil:
 		snapshot := contentSource.GetSnapshot()
@@ -1709,7 +1669,7 @@ func (s *ControllerServer) createNVMeOFTargetForClone(ctx context.Context, volum
 }
 
 // DeleteVolume deletes a volume and all its associated resources (NFS share or iSCSI target/extent).
-func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (resp *csi.DeleteVolumeResponse, err error) {
 	ctx, cancel := withTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 
@@ -1739,6 +1699,12 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 
 	// Get volume info for resource cleanup
 	volInfo, _ := s.driver.GetVolumeInfo(req.VolumeId)
+
+	protocol := protocolUnknown
+	if volInfo != nil {
+		protocol = volInfo.Protocol
+	}
+	defer func() { s.driver.metrics.RecordVolumeOperation(protocol, volumeOperationDelete, err) }()
 
 	// Clean up protocol-specific resources (iSCSI target/extent/auth or NFS share)
 	if volInfo != nil && volInfo.Protocol == ProtocolISCSI {
@@ -2078,7 +2044,7 @@ func (s *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *c
 }
 
 // CreateSnapshot creates a ZFS snapshot of the source volume.
-func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (resp *csi.CreateSnapshotResponse, err error) {
 	ctx, cancel := withTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 
@@ -2096,6 +2062,8 @@ func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "volume not found: %v", err)
 	}
+
+	defer func() { s.driver.metrics.RecordVolumeOperation(volInfo.Protocol, volumeOperationSnapshot, err) }()
 
 	snapshotName := SanitizeVolumeName(req.Name)
 	expectedSnapshotID := fmt.Sprintf("%s@%s", volInfo.DatasetPath, snapshotName)
@@ -2347,7 +2315,7 @@ func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 }
 
 // ControllerExpandVolume expands the ZFS dataset or ZVOL capacity.
-func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (resp *csi.ControllerExpandVolumeResponse, err error) {
 	ctx, cancel := withTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 
@@ -2365,6 +2333,8 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "volume not found: %v", err)
 	}
+
+	defer func() { s.driver.metrics.RecordVolumeOperation(volInfo.Protocol, volumeOperationExpand, err) }()
 
 	newSize := req.CapacityRange.RequiredBytes
 	if newSize > 0 && newSize < minVolumeSize {
