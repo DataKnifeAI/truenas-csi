@@ -1016,6 +1016,10 @@ func (d *Driver) NVMeOFPortID(ctx context.Context) (int, error) {
 	}
 
 	ch := d.nvmePortResolve.DoChan("nvme-port", func() (any, error) {
+		// The lookup is shared, so it must not end when the caller that
+		// started it gives up; each caller stops waiting at its own deadline.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), backendCheckTimeout)
+		defer cancel()
 		d.cacheMu.Lock()
 		cached := d.nvmeofPortID
 		d.cacheMu.Unlock()

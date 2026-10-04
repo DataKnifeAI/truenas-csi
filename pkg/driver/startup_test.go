@@ -529,3 +529,47 @@ func TestNVMeOFPortID_WaiterHonoursItsDeadline(t *testing.T) {
 		t.Fatalf("NVMeOFPortID returned after %v, want it to stop at its 100ms deadline", elapsed)
 	}
 }
+
+// The shared lookup outlives the caller that started it, so a CreateVolume that
+// times out does not fail the other waiters or leave the port unresolved.
+func TestNVMeOFPortID_SurvivesStarterTimeout(t *testing.T) {
+	var creates atomic.Int32
+	url, release := fakeTrueNASServer(t, map[string]string{
+		"nvmet.port.query":  "slow-empty",
+		"nvmet.port.create": "slow-port",
+	}, func(method string) {
+		if method == "nvmet.port.create" {
+			creates.Add(1)
+		}
+	})
+	d, _ := newTestDriver(t, url)
+	t.Cleanup(func() {
+		release()
+		d.client.Close()
+	})
+	if err := d.client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect to fake TrueNAS: %v", err)
+	}
+
+	starter, cancelStarter := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelStarter()
+	starterErr := make(chan error, 1)
+	go func() {
+		_, err := d.NVMeOFPortID(starter)
+		starterErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := d.NVMeOFPortID(ctx)
+	if err != nil || id != 7 {
+		t.Fatalf("NVMeOFPortID = %d, %v; want 7, nil", id, err)
+	}
+	if err := <-starterErr; !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("starter NVMeOFPortID = %v, want context.DeadlineExceeded", err)
+	}
+	if n := creates.Load(); n != 1 {
+		t.Fatalf("created %d NVMe-oF ports, want 1", n)
+	}
+}
