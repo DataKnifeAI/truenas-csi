@@ -25,6 +25,52 @@ const (
 	NetworkPolicyName        = "truenas-csi-allow-metrics"
 )
 
+// Workload configuration
+const (
+	// CredentialsSecretKey is the key in the credentials Secret that holds the
+	// TrueNAS API key.
+	CredentialsSecretKey = "api-key"
+
+	// ConfigHashAnnotation is set on the CSI pod templates to a hash of the
+	// configuration their containers read from the environment, so that changing
+	// that configuration rolls the pods.
+	ConfigHashAnnotation = "csi.truenas.io/config-hash"
+)
+
+// Trusted CA bundle (spec.trustedCA)
+const (
+	// VolumeTrustedCA carries the bundle into the driver containers.
+	VolumeTrustedCA = "trusted-ca"
+
+	// TrustedCAMountDir is where the bundle is mounted: a directory of the driver's
+	// own, so the bundle adds to the image's CA store instead of replacing it,
+	// whichever image is running.
+	TrustedCAMountDir = "/etc/truenas-csi/trusted-ca"
+	TrustedCAFileName = "ca-bundle.crt"
+
+	// DefaultTrustedCAKey is the ConfigMap key read when spec.trustedCA names none,
+	// which is also where OpenShift injects the cluster's trusted CA bundle.
+	DefaultTrustedCAKey = "ca-bundle.crt"
+
+	// EnvCABundle points the driver at the mounted bundle.
+	EnvCABundle = "TRUENAS_CA_BUNDLE"
+)
+
+// Outbound proxy (spec.useClusterProxy): each proxy variable and the ConfigMap key
+// it is published under, for the driver containers to read back into the variable.
+// A slice, not a map, so the containers' env keeps one order across reconciles.
+var proxyVariables = []struct{ env, key string }{
+	{"HTTP_PROXY", "httpProxy"},
+	{"HTTPS_PROXY", "httpsProxy"},
+	{"NO_PROXY", "noProxy"},
+}
+
+// Status condition reasons
+const (
+	// ReasonRemoved is the Ready condition's reason under managementState Removed.
+	ReasonRemoved = "Removed"
+)
+
 // Service accounts
 const (
 	ControllerServiceAccount = "truenas-csi-controller-sa"

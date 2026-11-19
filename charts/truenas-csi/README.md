@@ -38,6 +38,35 @@ helm install truenas-csi truenas-csi/truenas-csi \
 | `truenas.nvmeofPortal` | `""` | NVMe-oF portal `host:port`. Derived from `truenas.url` when empty |
 | `truenas.iscsiIQNBase` | `""` | Base IQN for iSCSI targets. The appliance's own basename wins when they differ |
 | `truenas.insecureSkipTLS` | `false` | Skip TLS verification. Needed for the certificate TrueNAS self-signs |
+| `truenas.caBundle` | `""` | PEM CA certificates to trust for the TrueNAS API, in addition to the image's public CAs, for a certificate issued by a private CA. The chart puts them in a ConfigMap |
+| `truenas.existingCABundleConfigMap` | `""` | Name of a ConfigMap you manage instead, for example one OpenShift fills with the cluster's trusted CAs |
+| `truenas.existingCABundleKey` | `ca-bundle.crt` | Key inside that ConfigMap holding the certificates |
+
+A CA bundle only helps if the TrueNAS certificate is also issued for the host in
+`truenas.url`. The self-signed certificate TrueNAS ships with is issued for
+`localhost`, so either replace it with one from your CA or use
+`truenas.insecureSkipTLS`.
+
+An upgrade that changes any of these, or `truenas.apiKey`, rolls the controller
+and node pods, since they read the settings only at startup. The chart cannot see
+inside `truenas.existingSecret` or `truenas.existingCABundleConfigMap`, so after
+changing either of those, restart the pods yourself:
+
+```bash
+kubectl -n truenas-csi rollout restart deployment/truenas-csi-controller
+kubectl -n truenas-csi rollout restart daemonset/truenas-csi-node
+```
+
+### Outbound proxy
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `proxy.httpsProxy` | `""` | Proxy for a `wss://` TrueNAS URL. Empty connects directly |
+| `proxy.httpProxy` | `""` | Proxy for a `ws://` TrueNAS URL |
+| `proxy.noProxy` | `""` | Hosts, domains and CIDRs to reach without the proxy, comma-separated |
+
+Only the driver's connection to the TrueNAS API uses the proxy; storage traffic
+never does. See [Outbound Proxy](../../docs/proxy.md).
 
 ### Deployment
 

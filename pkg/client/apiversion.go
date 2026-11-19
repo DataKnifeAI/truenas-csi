@@ -39,7 +39,7 @@ func resolveAPIURL(rawURL, version string) (string, error) {
 
 // fetchSupportedAPIVersions issues GET <http(s)>://<host>/api/versions and returns
 // the API versions the server supports (e.g. ["v25.04.0","v25.10.0"]).
-func fetchSupportedAPIVersions(ctx context.Context, rawURL string, tlsConfig *tls.Config) ([]string, error) {
+func fetchSupportedAPIVersions(ctx context.Context, rawURL string, tlsConfig *tls.Config, proxy func(*http.Request) (*url.URL, error)) ([]string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid TrueNAS URL %q: %w", rawURL, err)
@@ -66,6 +66,7 @@ func fetchSupportedAPIVersions(ctx context.Context, rawURL string, tlsConfig *tl
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
+			Proxy:               proxy,
 			TLSClientConfig:     tlsConfig,
 			TLSHandshakeTimeout: defaultTLSHandshakeTimeout,
 		},
@@ -147,7 +148,7 @@ func (c *Client) verifyAndPinAPIVersion(ctx context.Context) error {
 		return err
 	}
 
-	supported, ferr := fetchSupportedAPIVersions(ctx, c.config.URL, c.config.TLSConfig)
+	supported, ferr := fetchSupportedAPIVersions(ctx, c.config.URL, c.config.TLSConfig, c.config.Proxy)
 	if ferr != nil {
 		c.log.V(logLevelInfo).Info("Could not fetch supported TrueNAS API versions; proceeding with /api/current (reconnect will retry if the server is unavailable)",
 			"error", ferr)
@@ -163,5 +164,14 @@ func (c *Client) verifyAndPinAPIVersion(ctx context.Context) error {
 	c.log.V(logLevelInfo).Info("Verified TrueNAS meets the minimum API version; connecting to /api/current",
 		"minVersion", MinAPIVersion, "supported", supported)
 	c.config.URL = resolved
+	c.supportedVersions = supported
 	return nil
+}
+
+// HasAPIVersion reports whether the server advertised API version v (e.g. "v27.0.0")
+// at preflight. A server lists its own version and the older ones it still serves,
+// so this doubles as a "server is at least v" check. Returns false when the
+// preflight fetch failed.
+func (c *Client) HasAPIVersion(v string) bool {
+	return versionSupported(c.supportedVersions, v)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ const (
 const (
 	methodISCSITargetCreate       = "iscsi.target.create"
 	methodISCSITargetQuery        = "iscsi.target.query"
+	methodISCSITargetUpdate       = "iscsi.target.update"
 	methodISCSITargetDelete       = "iscsi.target.delete"
 	methodISCSIExtentCreate       = "iscsi.extent.create"
 	methodISCSIExtentQuery        = "iscsi.extent.query"
@@ -45,6 +47,14 @@ const (
 	methodISCSIInitiatorDelete    = "iscsi.initiator.delete"
 	methodISCSIPortalQuery        = "iscsi.portal.query"
 	methodISCSIGlobalConfig       = "iscsi.global.config"
+)
+
+// iSCSI authentication methods, as TrueNAS names them. A target group's
+// authmethod takes all three, and so does an auth entry's discovery_auth.
+const (
+	ISCSIAuthMethodNone       = "NONE"
+	ISCSIAuthMethodCHAP       = "CHAP"
+	ISCSIAuthMethodCHAPMutual = "CHAP_MUTUAL"
 )
 
 // TrueNAS API method names for snapshots
@@ -70,7 +80,8 @@ const (
 
 // TrueNAS API method names for ZFS resources
 const (
-	methodZFSResourceQuery = "zfs.resource.query"
+	methodZFSResourceQuery = "zfs.resource.query" // private from API v28 on
+	methodZFSResourceList  = "zfs.resource.list"  // the same call, renamed in v28
 )
 
 // TrueNAS API method names for filesystem and core (jobs)
@@ -878,7 +889,7 @@ func (c *Client) CreateISCSITargetWithAuth(ctx context.Context, name, alias stri
 	}
 
 	if authTag > 0 {
-		group.AuthMethod = "CHAP"
+		group.AuthMethod = ISCSIAuthMethodCHAP
 		group.Auth = authTag
 	}
 
@@ -886,6 +897,13 @@ func (c *Client) CreateISCSITargetWithAuth(ctx context.Context, name, alias stri
 		group.Initiator = initiatorID
 	}
 
+	return c.CreateISCSITargetWithGroup(ctx, name, alias, group)
+}
+
+// CreateISCSITargetWithGroup creates a new iSCSI target with a single portal group,
+// which carries the target's access control: its auth method, the tag of the auth
+// group it accepts, and the initiator group it allows.
+func (c *Client) CreateISCSITargetWithGroup(ctx context.Context, name, alias string, group ISCSITargetGroup) (*ISCSITarget, error) {
 	params := &ISCSITargetCreateOptions{
 		Name:   name,
 		Alias:  alias,
@@ -899,6 +917,26 @@ func (c *Client) CreateISCSITargetWithAuth(ctx context.Context, name, alias stri
 		return nil, fmt.Errorf("failed to create iSCSI target: %w", err)
 	}
 	return &target, nil
+}
+
+// UpdateISCSITargetGroups replaces the portal groups of an iSCSI target.
+func (c *Client) UpdateISCSITargetGroups(ctx context.Context, id int, groups []ISCSITargetGroup) (*ISCSITarget, error) {
+	var target ISCSITarget
+	err := c.Call(ctx, methodISCSITargetUpdate, []any{id, map[string]any{"groups": groups}}, &target)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update iSCSI target %d: %w", id, err)
+	}
+	return &target, nil
+}
+
+// ListISCSITargets returns every iSCSI target.
+func (c *Client) ListISCSITargets(ctx context.Context) ([]ISCSITarget, error) {
+	var targets []ISCSITarget
+	err := c.Call(ctx, methodISCSITargetQuery, []any{[][]any{}, &QueryOptions{}}, &targets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI targets: %w", err)
+	}
+	return targets, nil
 }
 
 // CreateISCSIExtent creates a new iSCSI extent backed by a disk.
@@ -1028,6 +1066,16 @@ func (c *Client) GetISCSIAuthByTag(ctx context.Context, tag int) (*ISCSIAuth, er
 	return &auths[0], nil
 }
 
+// ListISCSIAuthByTag returns every auth entry in the auth group with the given tag.
+func (c *Client) ListISCSIAuthByTag(ctx context.Context, tag int) ([]ISCSIAuth, error) {
+	var auths []ISCSIAuth
+	err := c.Call(ctx, methodISCSIAuthQuery, []any{[][]any{{"tag", "=", tag}}, &QueryOptions{}}, &auths)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query iSCSI auth: %w", err)
+	}
+	return auths, nil
+}
+
 // DeleteISCSIAuth deletes an iSCSI authentication credential by its ID.
 func (c *Client) DeleteISCSIAuth(ctx context.Context, id int) error {
 	err := c.Call(ctx, methodISCSIAuthDelete, []any{id}, nil)
@@ -1083,9 +1131,9 @@ func (c *Client) QueryISCSIPortals(ctx context.Context) ([]ISCSIPortal, error) {
 	return portals, nil
 }
 
-// GetISCSIPortalByAddress finds the iSCSI portal whose listen addresses
-// contain the given IP. Returns nil if no matching portal is found.
-func (c *Client) GetISCSIPortalByAddress(ctx context.Context, address string) (*ISCSIPortal, error) {
+// GetISCSIPortalByAddress finds the iSCSI portal that listens on any of the given
+// addresses, or on all addresses. Returns nil if no matching portal is found.
+func (c *Client) GetISCSIPortalByAddress(ctx context.Context, addresses ...string) (*ISCSIPortal, error) {
 	portals, err := c.QueryISCSIPortals(ctx)
 	if err != nil {
 		return nil, err
@@ -1093,7 +1141,7 @@ func (c *Client) GetISCSIPortalByAddress(ctx context.Context, address string) (*
 
 	for i := range portals {
 		for _, listen := range portals[i].Listen {
-			if listen.IP == address || listen.IP == "0.0.0.0" {
+			if listen.IP == "0.0.0.0" || slices.Contains(addresses, listen.IP) {
 				return &portals[i], nil
 			}
 		}
@@ -1135,10 +1183,13 @@ func (c *Client) CreateSnapshot(ctx context.Context, dataset, name string, recur
 	return &snapshot, nil
 }
 
-// DeleteSnapshot deletes a ZFS snapshot by name.
+// DeleteSnapshot deletes a ZFS snapshot by name. The destruction is deferred: a
+// snapshot with no clones is destroyed at once, and one that clones still depend
+// on is destroyed by ZFS when the last of them goes. ZFS refuses an immediate
+// destroy of such a snapshot, and a refused one would be left behind for good.
 func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
 	options := &SnapshotDeleteOptions{
-		Defer: false,
+		Defer: true,
 	}
 
 	err := c.Call(ctx, methodSnapshotDelete, []any{name, options}, nil)
@@ -1163,15 +1214,33 @@ func (c *Client) CloneSnapshot(ctx context.Context, snapshot, destination string
 	return c.GetDataset(ctx, destination)
 }
 
+// PendingDestroy reports whether the snapshot has been deleted and its destruction
+// deferred until its last clone goes. ZFS still has it, but it no longer exists as
+// far as anything asking for snapshots is concerned.
+func (s Snapshot) PendingDestroy() bool {
+	prop, _ := s.Properties["defer_destroy"].(map[string]any)
+	return prop["value"] == "on"
+}
+
+// querySnapshots returns the snapshots matching filters, leaving out those
+// pending destruction.
+func (c *Client) querySnapshots(ctx context.Context, filters [][]any) ([]Snapshot, error) {
+	var snapshots []Snapshot
+	if err := c.Call(ctx, methodSnapshotQuery, []any{filters, &QueryOptions{}}, &snapshots); err != nil {
+		return nil, err
+	}
+	live := snapshots[:0]
+	for _, s := range snapshots {
+		if !s.PendingDestroy() {
+			live = append(live, s)
+		}
+	}
+	return live, nil
+}
+
 // ListSnapshots returns all snapshots for a given dataset.
 func (c *Client) ListSnapshots(ctx context.Context, dataset string) ([]Snapshot, error) {
-	filters := [][]any{
-		{"dataset", "=", dataset},
-	}
-	options := &QueryOptions{}
-
-	var snapshots []Snapshot
-	err := c.Call(ctx, methodSnapshotQuery, []any{filters, options}, &snapshots)
+	snapshots, err := c.querySnapshots(ctx, [][]any{{"dataset", "=", dataset}})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list snapshots: %w", err)
 	}
@@ -1183,13 +1252,7 @@ func (c *Client) ListSnapshots(ctx context.Context, dataset string) ([]Snapshot,
 // Returns the first matching snapshot or nil if not found.
 func (c *Client) FindSnapshotByName(ctx context.Context, name string) (*Snapshot, error) {
 	// Use snapshot_name filter to search by the name part
-	filters := [][]any{
-		{"snapshot_name", "=", name},
-	}
-	options := &QueryOptions{}
-
-	var snapshots []Snapshot
-	err := c.Call(ctx, methodSnapshotQuery, []any{filters, options}, &snapshots)
+	snapshots, err := c.querySnapshots(ctx, [][]any{{"snapshot_name", "=", name}})
 	if err != nil {
 		return nil, fmt.Errorf("failed to find snapshot by name: %w", err)
 	}
@@ -1200,14 +1263,20 @@ func (c *Client) FindSnapshotByName(ctx context.Context, name string) (*Snapshot
 	return &snapshots[0], nil
 }
 
+// ListSnapshotsByNamePrefix returns the snapshots, across all datasets, whose name
+// (the part after @) starts with prefix.
+func (c *Client) ListSnapshotsByNamePrefix(ctx context.Context, prefix string) ([]Snapshot, error) {
+	snapshots, err := c.querySnapshots(ctx, [][]any{{"snapshot_name", "^", prefix}})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list snapshots named %s*: %w", prefix, err)
+	}
+	return snapshots, nil
+}
+
 // ListAllSnapshots returns all snapshots across all datasets.
 func (c *Client) ListAllSnapshots(ctx context.Context) ([]Snapshot, error) {
 	// Empty filter list means return all snapshots
-	filters := [][]any{}
-	options := &QueryOptions{}
-
-	var snapshots []Snapshot
-	err := c.Call(ctx, methodSnapshotQuery, []any{filters, options}, &snapshots)
+	snapshots, err := c.querySnapshots(ctx, [][]any{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list all snapshots: %w", err)
 	}
@@ -1324,8 +1393,13 @@ func (c *Client) GetAvailableSpace(ctx context.Context, poolName string) (int64,
 		GetSource:  false,
 	}
 
+	method := methodZFSResourceQuery
+	if c.HasAPIVersion("v28.0.0") {
+		method = methodZFSResourceList
+	}
+
 	var resources []ZFSResource
-	err := c.Call(ctx, methodZFSResourceQuery, []any{options}, &resources)
+	err := c.Call(ctx, method, []any{options}, &resources)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query ZFS resource %s: %w", poolName, err)
 	}

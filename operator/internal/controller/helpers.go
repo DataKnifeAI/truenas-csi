@@ -13,18 +13,18 @@ import (
 
 // buildTrueNASEnvVars creates the environment variables for TrueNAS CSI containers
 func buildTrueNASEnvVars(csi *csiv1alpha1.TrueNASCSI) []corev1.EnvVar {
-	return []corev1.EnvVar{
+	return append([]corev1.EnvVar{
 		{Name: "CSI_ENDPOINT", Value: CSISocketPath},
 		fieldRefEnvVar("NODE_ID", "spec.nodeName"),
 		configMapEnvVar("TRUENAS_URL", ConfigMapName, "truenasURL", false),
-		secretEnvVar("TRUENAS_API_KEY", csi.Spec.CredentialsSecret, "api-key"),
+		secretEnvVar("TRUENAS_API_KEY", csi.Spec.CredentialsSecret, CredentialsSecretKey),
 		configMapEnvVar("TRUENAS_DEFAULT_POOL", ConfigMapName, "defaultPool", false),
 		configMapEnvVar("TRUENAS_NFS_SERVER", ConfigMapName, "nfsServer", true),
 		configMapEnvVar("TRUENAS_ISCSI_PORTAL", ConfigMapName, "iscsiPortal", true),
 		configMapEnvVar("TRUENAS_NVMEOF_PORTAL", ConfigMapName, "nvmeofPortal", true),
 		configMapEnvVar("TRUENAS_ISCSI_IQN_BASE", ConfigMapName, "iscsiIQNBase", true),
 		configMapEnvVar("TRUENAS_INSECURE_SKIP_VERIFY", ConfigMapName, "truenasInsecure", true),
-	}
+	}, append(proxyEnvVars(), trustedCAEnvVars(csi)...)...)
 }
 
 // fieldRefEnvVar creates an environment variable from a field reference

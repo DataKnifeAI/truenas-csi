@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -89,9 +90,8 @@ const (
 	paramISCSIChapPeerSecret = "iscsi.chapPeerSecret"
 	paramISCSIInitiators     = "iscsi.initiators"
 
-	// iSCSI auth types
-	iscsiAuthTypeCHAP   = "chap"
-	iscsiAuthTypeMutual = "CHAP_MUTUAL"
+	// csi-lib-iscsi's name for CHAP, in Connector.AuthType and Secrets.SecretsType
+	iscsiAuthTypeCHAP = "chap"
 
 	// NVMe-oF parameters. DH-CHAP credentials are plaintext StorageClass params
 	// (like iSCSI CHAP) and flow to the node via the volume context.
@@ -158,6 +158,14 @@ var (
 type ControllerServer struct {
 	driver *Driver
 	csi.UnimplementedControllerServer
+
+	// iscsiAuthMu serializes iSCSI auth tag allocation with the auth creation.
+	iscsiAuthMu sync.Mutex
+
+	// cloneSnapshotMu keeps the sweep of leftover clone snapshots from deleting one
+	// a clone in progress is about to use: clones hold it for reading, the sweep
+	// for writing.
+	cloneSnapshotMu sync.RWMutex
 }
 
 // withTimeout wraps a context with a timeout if it doesn't already have a deadline
@@ -238,6 +246,11 @@ func (s *ControllerServer) validateStorageClassParameters(ctx context.Context, p
 
 	// Validate NVMe-oF DH-CHAP parameters
 	if err := validateNVMeOFParameters(parameters); err != nil {
+		return err
+	}
+
+	// Validate iSCSI CHAP parameters
+	if _, err := iscsiAccessFromParameters(parameters); err != nil {
 		return err
 	}
 
@@ -1060,9 +1073,15 @@ func (s *ControllerServer) deleteNVMeOFResources(ctx context.Context, volInfo *V
 
 // ensureISCSIChain verifies that the iSCSI target, extent, and target-extent association
 // exist for an existing ZVOL. If any are missing (e.g., a previous CreateVolume was
-// interrupted by a connection drop after creating the ZVOL), they are created.
+// interrupted by a connection drop after creating the ZVOL), they are created, and
+// the target is given the same access control a single-pass CreateVolume gives it.
 // Returns the volume context map with targetPortal, targetIQN, and lun populated.
 func (s *ControllerServer) ensureISCSIChain(ctx context.Context, volumeID, datasetPath string, parameters map[string]string) (map[string]string, error) {
+	access, err := iscsiAccessFromParameters(parameters)
+	if err != nil {
+		return nil, err
+	}
+
 	zvolPath := fmt.Sprintf("zvol/%s", datasetPath)
 	iqnBase := s.driver.ResolveISCSIIQNBase(ctx, parameters)
 	targetSuffix := makeISCSITargetSuffix(volumeID)
@@ -1086,13 +1105,9 @@ func (s *ControllerServer) ensureISCSIChain(ctx context.Context, volumeID, datas
 		// Extent doesn't exist - create it along with target and association
 		s.driver.Log().Info("iSCSI extent missing for existing ZVOL, completing iSCSI setup", "volumeId", volumeID, "zvolPath", zvolPath)
 
-		target, err := s.driver.Client().CreateISCSITargetWithAuth(ctx, targetSuffix, fmt.Sprintf("CSI volume %s", volumeID), portalID, 0, 0)
+		target, err := s.ensureISCSITarget(ctx, volumeID, targetSuffix, portalID, access)
 		if err != nil {
-			// Target may already exist from a partial creation
-			target, err = s.driver.Client().GetISCSITargetByName(ctx, targetSuffix)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create or find iSCSI target: %w", err)
-			}
+			return nil, err
 		}
 
 		extent, err = s.driver.Client().CreateISCSIExtent(ctx, extentName, zvolPath, blocksize)
@@ -1105,12 +1120,7 @@ func (s *ControllerServer) ensureISCSIChain(ctx context.Context, volumeID, datas
 			return nil, fmt.Errorf("failed to associate target and extent: %w", err)
 		}
 
-		fullIQN := fmt.Sprintf("%s:%s", iqnBase, target.Name)
-		volCtx := copyParameters(parameters)
-		volCtx[PublishContextTargetPortal] = s.driver.ISCSIPortal()
-		volCtx[PublishContextTargetIQN] = fullIQN
-		volCtx[PublishContextLUN] = "0"
-		return volCtx, nil
+		return s.iscsiVolumeContext(parameters, fmt.Sprintf("%s:%s", iqnBase, target.Name), 0), nil
 	}
 
 	// Extent exists - look up the target via target-extent association
@@ -1120,38 +1130,28 @@ func (s *ControllerServer) ensureISCSIChain(ctx context.Context, volumeID, datas
 		// Find or create the target, then create the association.
 		s.driver.Log().Info("iSCSI target-extent association missing, completing setup", "volumeId", volumeID, "extentId", extent.ID)
 
-		target, tErr := s.driver.Client().CreateISCSITargetWithAuth(ctx, targetSuffix, fmt.Sprintf("CSI volume %s", volumeID), portalID, 0, 0)
-		if tErr != nil {
-			target, tErr = s.driver.Client().GetISCSITargetByName(ctx, targetSuffix)
-			if tErr != nil {
-				return nil, fmt.Errorf("failed to create or find iSCSI target: %w", tErr)
-			}
+		target, err := s.ensureISCSITarget(ctx, volumeID, targetSuffix, portalID, access)
+		if err != nil {
+			return nil, err
 		}
 
-		_, aErr := s.driver.Client().CreateISCSITargetExtent(ctx, target.ID, extent.ID, 0)
-		if aErr != nil {
-			return nil, fmt.Errorf("failed to associate target and extent: %w", aErr)
+		_, err = s.driver.Client().CreateISCSITargetExtent(ctx, target.ID, extent.ID, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to associate target and extent: %w", err)
 		}
 
-		fullIQN := fmt.Sprintf("%s:%s", iqnBase, target.Name)
-		volCtx := copyParameters(parameters)
-		volCtx[PublishContextTargetPortal] = s.driver.ISCSIPortal()
-		volCtx[PublishContextTargetIQN] = fullIQN
-		volCtx[PublishContextLUN] = "0"
-		return volCtx, nil
+		return s.iscsiVolumeContext(parameters, fmt.Sprintf("%s:%s", iqnBase, target.Name), 0), nil
 	}
 
 	target, err := s.driver.Client().GetISCSITargetByID(ctx, targetExtent.Target)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find iSCSI target: %w", err)
 	}
+	if err := s.enforceISCSIAccess(ctx, volumeID, target, portalID, access); err != nil {
+		return nil, err
+	}
 
-	fullIQN := fmt.Sprintf("%s:%s", iqnBase, target.Name)
-	volCtx := copyParameters(parameters)
-	volCtx[PublishContextTargetPortal] = s.driver.ISCSIPortal()
-	volCtx[PublishContextTargetIQN] = fullIQN
-	volCtx[PublishContextLUN] = fmt.Sprintf("%d", targetExtent.LunID)
-	return volCtx, nil
+	return s.iscsiVolumeContext(parameters, fmt.Sprintf("%s:%s", iqnBase, target.Name), targetExtent.LunID), nil
 }
 
 // copyParameters returns a shallow copy of the map.
@@ -1185,6 +1185,11 @@ func bridgeISCSICHAPParams(parameters map[string]string) {
 }
 
 func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, datasetPath string, capacityBytes int64, parameters map[string]string) (*VolumeInfo, error) {
+	access, err := iscsiAccessFromParameters(parameters)
+	if err != nil {
+		return nil, err
+	}
+
 	portalID, err := s.driver.ISCSIPortalID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve iSCSI portal ID: %w", err)
@@ -1197,85 +1202,20 @@ func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, data
 		return nil, fmt.Errorf("failed to create ZVOL: %w", err)
 	}
 
-	// Create CHAP auth group if credentials are provided
-	var authID int
-	var authTag int
-	if chapUser, ok := parameters[paramISCSIChapUser]; ok && chapUser != "" {
-		chapSecret := parameters[paramISCSIChapSecret]
-		if chapSecret == "" {
-			s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
-			return nil, fmt.Errorf("iscsi.chapSecret is required when iscsi.chapUser is specified")
-		}
-
-		// Get next available auth tag
-		nextTag, err := s.driver.Client().GetNextISCSIAuthTag(ctx)
-		if err != nil {
-			s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
-			return nil, fmt.Errorf("failed to get next auth tag: %w", err)
-		}
-
-		authOpts := &client.ISCSIAuthCreateOptions{
-			Tag:    nextTag,
-			User:   chapUser,
-			Secret: chapSecret,
-		}
-
-		// Add mutual CHAP if provided
-		if peerUser, ok := parameters[paramISCSIChapPeerUser]; ok && peerUser != "" {
-			authOpts.PeerUser = peerUser
-			authOpts.PeerSecret = parameters[paramISCSIChapPeerSecret]
-			authOpts.DiscoveryAuth = iscsiAuthTypeMutual
-		}
-
-		auth, err := s.driver.Client().CreateISCSIAuth(ctx, authOpts)
-		if err != nil {
-			s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
-			return nil, fmt.Errorf("failed to create CHAP auth: %w", err)
-		}
-		authID = auth.ID
-		authTag = auth.Tag
-		s.driver.Log().V(LogLevelDebug).Info("Created CHAP auth for iSCSI target", "authId", authID, "tag", authTag, "user", chapUser)
-
-		// The target now requires CHAP; make sure the node can authenticate by
-		// mirroring the credentials into the node-side parameters carried in the
-		// volume context.
-		bridgeISCSICHAPParams(parameters)
-	}
-
-	// Create initiator group if specified
-	var initiatorID int
-	initiators := parameters[paramISCSIInitiators]
-	if initiators != "" {
-		initOpts := &client.ISCSIInitiatorCreateOptions{
-			Initiators: strings.Split(initiators, ","),
-			Comment:    fmt.Sprintf("CSI volume %s", volumeID),
-		}
-
-		init, err := s.driver.Client().CreateISCSIInitiator(ctx, initOpts)
-		if err != nil {
-			// Cleanup auth if created
-			if authID > 0 {
-				s.driver.Client().DeleteISCSIAuth(ctx, authID)
-			}
-			s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
-			return nil, fmt.Errorf("failed to create initiator group: %w", err)
-		}
-		initiatorID = init.ID
-		s.driver.Log().V(LogLevelDebug).Info("Created initiator group for iSCSI target", "initiatorId", initiatorID, "initiators", initiators)
+	// The auth entry and initiator group the StorageClass asks for, referenced by
+	// the target's portal group.
+	group, undoAccess, err := s.createISCSIAccess(ctx, volumeID, portalID, access)
+	if err != nil {
+		s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
+		return nil, err
 	}
 
 	iqnBase := s.driver.ResolveISCSIIQNBase(ctx, parameters)
 
 	targetSuffix := makeISCSITargetSuffix(volumeID)
-	target, err := s.driver.Client().CreateISCSITargetWithAuth(ctx, targetSuffix, fmt.Sprintf("CSI volume %s", volumeID), portalID, authTag, initiatorID)
+	target, err := s.driver.Client().CreateISCSITargetWithGroup(ctx, targetSuffix, fmt.Sprintf("CSI volume %s", volumeID), group)
 	if err != nil {
-		// Cleanup auth and initiator if created
-		if initiatorID > 0 {
-			s.driver.Client().DeleteISCSIInitiator(ctx, initiatorID)
-		}
-		if authID > 0 {
-			s.driver.Client().DeleteISCSIAuth(ctx, authID)
-		}
+		undoAccess()
 		s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
 		return nil, fmt.Errorf("failed to create iSCSI target: %w", err)
 	}
@@ -1292,12 +1232,7 @@ func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, data
 	if err != nil {
 		// Full cleanup: target, initiator, auth, dataset
 		s.driver.Client().DeleteISCSITarget(ctx, target.ID, &client.ISCSITargetDeleteOptions{Force: true})
-		if initiatorID > 0 {
-			s.driver.Client().DeleteISCSIInitiator(ctx, initiatorID)
-		}
-		if authID > 0 {
-			s.driver.Client().DeleteISCSIAuth(ctx, authID)
-		}
+		undoAccess()
 		s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
 		return nil, fmt.Errorf("failed to create iSCSI extent: %w", err)
 	}
@@ -1307,12 +1242,7 @@ func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, data
 		// Full cleanup: extent, target, initiator, auth, dataset
 		s.driver.Client().DeleteISCSIExtent(ctx, extent.ID, &client.ISCSIExtentDeleteOptions{Force: true})
 		s.driver.Client().DeleteISCSITarget(ctx, target.ID, &client.ISCSITargetDeleteOptions{Force: true})
-		if initiatorID > 0 {
-			s.driver.Client().DeleteISCSIInitiator(ctx, initiatorID)
-		}
-		if authID > 0 {
-			s.driver.Client().DeleteISCSIAuth(ctx, authID)
-		}
+		undoAccess()
 		s.driver.Client().DeleteDataset(ctx, datasetPath, &client.DatasetDeleteOptions{Recursive: true, Force: true})
 		return nil, fmt.Errorf("failed to associate target and extent: %w", err)
 	}
@@ -1327,25 +1257,20 @@ func (s *ControllerServer) createISCSIVolume(ctx context.Context, volumeID, data
 
 	pool := client.ExtractPoolFromPath(datasetPath)
 	volInfo := &VolumeInfo{
-		ID:               volumeID,
-		Name:             volumeID,
-		CapacityBytes:    capacityBytes,
-		DatasetPath:      datasetPath,
-		PoolName:         pool,
-		Protocol:         ProtocolISCSI,
-		TargetIQN:        fullIQN,
-		TargetPortal:     s.driver.ISCSIPortal(),
-		LUN:              0,
-		ISCSITargetID:    target.ID,
-		ISCSIExtentID:    extent.ID,
-		ISCSIAuthID:      authID,
-		ISCSIInitiatorID: initiatorID,
-		VolumeContext:    parameters,
+		ID:                volumeID,
+		Name:              volumeID,
+		CapacityBytes:     capacityBytes,
+		DatasetPath:       datasetPath,
+		PoolName:          pool,
+		Protocol:          ProtocolISCSI,
+		TargetIQN:         fullIQN,
+		TargetPortal:      s.driver.ISCSIPortal(),
+		LUN:               0,
+		ISCSITargetID:     target.ID,
+		ISCSIExtentID:     extent.ID,
+		ISCSITargetGroups: []client.ISCSITargetGroup{group},
+		VolumeContext:     s.iscsiVolumeContext(parameters, fullIQN, 0),
 	}
-
-	volInfo.VolumeContext[PublishContextTargetPortal] = s.driver.ISCSIPortal()
-	volInfo.VolumeContext[PublishContextTargetIQN] = fullIQN
-	volInfo.VolumeContext[PublishContextLUN] = "0"
 
 	return volInfo, nil
 }
@@ -1426,7 +1351,7 @@ func (s *ControllerServer) createVolumeFromSource(ctx context.Context, req *csi.
 			Volume: &csi.Volume{
 				VolumeId:      volumeID,
 				CapacityBytes: capacityBytes,
-				VolumeContext: parameters,
+				VolumeContext: volInfo.VolumeContext,
 				ContentSource: contentSource,
 			},
 		}, nil
@@ -1442,20 +1367,9 @@ func (s *ControllerServer) createVolumeFromSource(ctx context.Context, req *csi.
 			return nil, volumeLookupError(sourceVolume.VolumeId, err)
 		}
 
-		sanitizedVolumeID := strings.ReplaceAll(volumeID, "/", "-")
-		snapshotName := fmt.Sprintf("csi-clone-%s-%d", sanitizedVolumeID, time.Now().Unix())
-		snapshot, err := s.driver.Client().CreateSnapshot(ctx, sourceInfo.DatasetPath, snapshotName, false)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to create snapshot for clone: %v", err)
+		if err := s.cloneFromVolume(ctx, volumeID, sourceInfo.DatasetPath, datasetPath); err != nil {
+			return nil, err
 		}
-
-		_, err = s.driver.Client().CloneSnapshot(ctx, snapshot.ID, datasetPath)
-		if err != nil {
-			s.driver.Client().DeleteSnapshot(ctx, snapshot.ID)
-			return nil, status.Errorf(codes.Internal, "failed to clone volume: %v", err)
-		}
-
-		s.driver.Client().DeleteSnapshot(ctx, snapshot.ID)
 
 		requiredBytes := req.CapacityRange.RequiredBytes
 		if requiredBytes > 0 && requiredBytes < minVolumeSize {
@@ -1512,7 +1426,7 @@ func (s *ControllerServer) createVolumeFromSource(ctx context.Context, req *csi.
 			Volume: &csi.Volume{
 				VolumeId:      volumeID,
 				CapacityBytes: capacityBytes,
-				VolumeContext: parameters,
+				VolumeContext: volInfo.VolumeContext,
 				ContentSource: contentSource,
 			},
 		}, nil
@@ -1566,8 +1480,14 @@ func (s *ControllerServer) createNFSShareForClone(ctx context.Context, volumeID,
 	return volInfo, nil
 }
 
-// createISCSITargetForClone creates iSCSI target and extent for a cloned ZVOL.
+// createISCSITargetForClone creates iSCSI target and extent for a cloned ZVOL, with
+// the access control its StorageClass asks for, just as for a new volume.
 func (s *ControllerServer) createISCSITargetForClone(ctx context.Context, volumeID, datasetPath string, capacityBytes int64, parameters map[string]string) (*VolumeInfo, error) {
+	access, err := iscsiAccessFromParameters(parameters)
+	if err != nil {
+		return nil, err
+	}
+
 	portalID, err := s.driver.ISCSIPortalID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve iSCSI portal ID: %w", err)
@@ -1575,9 +1495,15 @@ func (s *ControllerServer) createISCSITargetForClone(ctx context.Context, volume
 
 	iqnBase := s.driver.ResolveISCSIIQNBase(ctx, parameters)
 
-	targetSuffix := makeISCSITargetSuffix(volumeID)
-	target, err := s.driver.Client().CreateISCSITarget(ctx, targetSuffix, fmt.Sprintf("CSI volume clone %s", volumeID), portalID)
+	group, undoAccess, err := s.createISCSIAccess(ctx, volumeID, portalID, access)
 	if err != nil {
+		return nil, err
+	}
+
+	targetSuffix := makeISCSITargetSuffix(volumeID)
+	target, err := s.driver.Client().CreateISCSITargetWithGroup(ctx, targetSuffix, fmt.Sprintf("CSI volume clone %s", volumeID), group)
+	if err != nil {
+		undoAccess()
 		return nil, err
 	}
 
@@ -1585,6 +1511,7 @@ func (s *ControllerServer) createISCSITargetForClone(ctx context.Context, volume
 	extent, err := s.driver.Client().CreateISCSIExtent(ctx, makeISCSIExtentName(volumeID), zvolPath, defaultISCSIBlocksize)
 	if err != nil {
 		s.driver.Client().DeleteISCSITarget(ctx, target.ID, &client.ISCSITargetDeleteOptions{Force: true})
+		undoAccess()
 		return nil, err
 	}
 
@@ -1592,6 +1519,7 @@ func (s *ControllerServer) createISCSITargetForClone(ctx context.Context, volume
 	if err != nil {
 		s.driver.Client().DeleteISCSIExtent(ctx, extent.ID, &client.ISCSIExtentDeleteOptions{Force: true})
 		s.driver.Client().DeleteISCSITarget(ctx, target.ID, &client.ISCSITargetDeleteOptions{Force: true})
+		undoAccess()
 		return nil, err
 	}
 
@@ -1599,23 +1527,20 @@ func (s *ControllerServer) createISCSITargetForClone(ctx context.Context, volume
 
 	pool := client.ExtractPoolFromPath(datasetPath)
 	volInfo := &VolumeInfo{
-		ID:            volumeID,
-		Name:          volumeID,
-		CapacityBytes: capacityBytes,
-		DatasetPath:   datasetPath,
-		PoolName:      pool,
-		Protocol:      ProtocolISCSI,
-		TargetIQN:     fullIQN,
-		TargetPortal:  s.driver.ISCSIPortal(),
-		LUN:           0,
-		ISCSITargetID: target.ID,
-		ISCSIExtentID: extent.ID,
-		VolumeContext: parameters,
+		ID:                volumeID,
+		Name:              volumeID,
+		CapacityBytes:     capacityBytes,
+		DatasetPath:       datasetPath,
+		PoolName:          pool,
+		Protocol:          ProtocolISCSI,
+		TargetIQN:         fullIQN,
+		TargetPortal:      s.driver.ISCSIPortal(),
+		LUN:               0,
+		ISCSITargetID:     target.ID,
+		ISCSIExtentID:     extent.ID,
+		ISCSITargetGroups: []client.ISCSITargetGroup{group},
+		VolumeContext:     s.iscsiVolumeContext(parameters, fullIQN, 0),
 	}
-
-	volInfo.VolumeContext[PublishContextTargetPortal] = s.driver.ISCSIPortal()
-	volInfo.VolumeContext[PublishContextTargetIQN] = fullIQN
-	volInfo.VolumeContext[PublishContextLUN] = "0"
 
 	return volInfo, nil
 }
@@ -1755,16 +1680,8 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 				s.driver.Log().V(LogLevelDebug).Error(err, "Failed to delete iSCSI extent", "extentId", volInfo.ISCSIExtentID)
 			}
 		}
-		if volInfo.ISCSIAuthID > 0 {
-			if err := s.driver.Client().DeleteISCSIAuth(ctx, volInfo.ISCSIAuthID); err != nil {
-				s.driver.Log().V(LogLevelDebug).Error(err, "Failed to delete iSCSI auth", "authId", volInfo.ISCSIAuthID)
-			}
-		}
-		if volInfo.ISCSIInitiatorID > 0 {
-			if err := s.driver.Client().DeleteISCSIInitiator(ctx, volInfo.ISCSIInitiatorID); err != nil {
-				s.driver.Log().V(LogLevelDebug).Error(err, "Failed to delete iSCSI initiator", "initiatorId", volInfo.ISCSIInitiatorID)
-			}
-		}
+		// The auth and initiator groups go only once no other target uses them.
+		s.releaseISCSIAccess(ctx, volInfo.ISCSITargetGroups)
 	}
 
 	// Clean up NVMe-oF resources (children-first; never delete the shared port).
@@ -2166,14 +2083,16 @@ func (s *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 		return &csi.DeleteSnapshotResponse{}, nil
 	}
 
+	// A volume restored from the snapshot may still depend on it. The delete is
+	// deferred, so ZFS destroys the snapshot once that volume is gone.
 	err := s.driver.Client().DeleteSnapshot(ctx, req.SnapshotId)
 	if err != nil {
 		if client.IsNotFoundError(err) {
 			return &csi.DeleteSnapshotResponse{}, nil
 		}
-		// For other errors, also return success for idempotency
-		s.driver.Log().V(LogLevelDebug).Info("Snapshot delete error, treating as already deleted", "snapshotId", req.SnapshotId, "error", err)
-		return &csi.DeleteSnapshotResponse{}, nil
+		// Reported rather than swallowed: the snapshot still exists, and the
+		// snapshotter retries a failed delete.
+		return nil, status.Errorf(codes.Internal, "failed to delete snapshot %s: %v", req.SnapshotId, err)
 	}
 
 	return &csi.DeleteSnapshotResponse{}, nil

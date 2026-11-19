@@ -24,6 +24,10 @@ var (
 	metricsAddr = flag.String("metrics-addr", "", "Listen address for the Prometheus metrics endpoint (e.g. :8080). Empty disables it, and TRUENAS_METRICS_ADDR is read instead")
 )
 
+// envCABundle names the environment variable holding the path of a PEM file of
+// CA certificates to trust for the TrueNAS API.
+const envCABundle = "TRUENAS_CA_BUNDLE"
+
 func main() {
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
@@ -152,6 +156,10 @@ func loadEnvConfig(config *driver.DriverConfig) error {
 			config.TrueNASInsecure = insecure
 		}
 	}
+
+	// Optional: a PEM file of CA certificates to trust for the TrueNAS API in
+	// addition to the system's, for a certificate issued by a private CA.
+	config.TrueNASCABundle = os.Getenv(envCABundle)
 
 	// Optional: serve Prometheus metrics on this address (e.g. ":8080"), disabled
 	// when empty. The deployment manifests configure it here rather than with the

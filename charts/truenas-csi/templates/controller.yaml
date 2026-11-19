@@ -18,10 +18,11 @@ spec:
         {{- with .Values.controller.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.controller.podAnnotations }}
       annotations:
+        {{- include "truenas-csi.configChecksum" . | nindent 8 }}
+        {{- with .Values.controller.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "truenas-csi.controllerServiceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -63,6 +64,7 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+            {{- include "truenas-csi.caBundleVolumeMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
           livenessProbe:
@@ -175,3 +177,4 @@ spec:
       volumes:
         - name: socket-dir
           emptyDir: {}
+        {{- include "truenas-csi.caBundleVolume" . | nindent 8 }}

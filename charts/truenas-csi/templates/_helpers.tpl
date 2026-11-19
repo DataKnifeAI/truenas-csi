@@ -29,6 +29,17 @@ app.kubernetes.io/part-of: {{ include "truenas-csi.name" . }}
 {{- end -}}
 
 {{/*
+Pod template annotation that changes with the ConfigMap and Secret. The containers
+read both through environment variables, which are resolved only when a container
+starts, so without it an upgrade that changes a setting would leave the pods on the
+old value. A Secret named by truenas.existingSecret is not rendered by the chart, so
+rotating the key in it is not covered.
+*/}}
+{{- define "truenas-csi.configChecksum" -}}
+checksum/config: {{ include (print .Template.BasePath "/config.yaml") . | sha256sum }}
+{{- end -}}
+
+{{/*
 Selector label for the controller. Immutable once deployed.
 */}}
 {{- define "truenas-csi.controllerSelectorLabel" -}}
@@ -62,6 +73,53 @@ Secret holding the API key: the one the user manages, or the one this chart crea
 {{ .Values.truenas.existingSecret }}
 {{- else -}}
 truenas-api-credentials
+{{- end -}}
+{{- end -}}
+
+{{/*
+CA certificates the driver trusts for the TrueNAS API in addition to the image's:
+from truenas.caBundle, in a ConfigMap this chart creates, or from a ConfigMap the
+user manages. Mounted at a path of the driver's own, so the image's CA store stays.
+*/}}
+{{- define "truenas-csi.caBundleEnabled" -}}
+{{- if and .Values.truenas.caBundle .Values.truenas.existingCABundleConfigMap -}}
+{{- fail "Set truenas.caBundle or truenas.existingCABundleConfigMap, not both" -}}
+{{- end -}}
+{{- if or .Values.truenas.caBundle .Values.truenas.existingCABundleConfigMap -}}true{{- end -}}
+{{- end -}}
+
+{{- define "truenas-csi.caBundleConfigMapName" -}}
+{{- if .Values.truenas.existingCABundleConfigMap -}}
+{{ .Values.truenas.existingCABundleConfigMap }}
+{{- else -}}
+{{ include "truenas-csi.fullname" . }}-trusted-ca
+{{- end -}}
+{{- end -}}
+
+{{- define "truenas-csi.caBundleKey" -}}
+{{- if .Values.truenas.existingCABundleConfigMap -}}
+{{- default "ca-bundle.crt" .Values.truenas.existingCABundleKey -}}
+{{- else -}}
+ca-bundle.crt
+{{- end -}}
+{{- end -}}
+
+{{- define "truenas-csi.caBundleVolumeMount" -}}
+{{- if include "truenas-csi.caBundleEnabled" . }}
+- name: trusted-ca
+  mountPath: /etc/truenas-csi/trusted-ca
+  readOnly: true
+{{- end -}}
+{{- end -}}
+
+{{- define "truenas-csi.caBundleVolume" -}}
+{{- if include "truenas-csi.caBundleEnabled" . }}
+- name: trusted-ca
+  configMap:
+    name: {{ include "truenas-csi.caBundleConfigMapName" . }}
+    items:
+      - key: {{ include "truenas-csi.caBundleKey" . }}
+        path: ca-bundle.crt
 {{- end -}}
 {{- end -}}
 
@@ -135,9 +193,31 @@ use separate keys.
       name: {{ include "truenas-csi.configMapName" $ctx }}
       key: {{ .metricsKey }}
       optional: true
+- name: HTTP_PROXY
+  valueFrom:
+    configMapKeyRef:
+      name: {{ include "truenas-csi.configMapName" $ctx }}
+      key: httpProxy
+      optional: true
+- name: HTTPS_PROXY
+  valueFrom:
+    configMapKeyRef:
+      name: {{ include "truenas-csi.configMapName" $ctx }}
+      key: httpsProxy
+      optional: true
+- name: NO_PROXY
+  valueFrom:
+    configMapKeyRef:
+      name: {{ include "truenas-csi.configMapName" $ctx }}
+      key: noProxy
+      optional: true
 {{- if ne $ctx.Values.driverName "csi.truenas.io" }}
 - name: CSI_DRIVER_NAME
   value: {{ $ctx.Values.driverName | quote }}
+{{- end }}
+{{- if include "truenas-csi.caBundleEnabled" $ctx }}
+- name: TRUENAS_CA_BUNDLE
+  value: /etc/truenas-csi/trusted-ca/ca-bundle.crt
 {{- end }}
 - name: NODE_ID
   valueFrom:
