@@ -9,13 +9,15 @@ A Container Storage Interface (CSI) driver for [TrueNAS 25.10.0+](https://www.tr
 - **NVMe-oF/TCP volumes** - Block storage over NVMe over Fabrics (TCP) with optional DH-CHAP authentication
 - **Dynamic provisioning** - Automatic volume creation and deletion
 - **Volume expansion** - Online resize of volumes
-- **Snapshots and clones** - CSI snapshot support for backup and cloning
+- **Snapshots and clones** - CSI snapshot support for backup and cloning ([docs](docs/snapshots.md))
 - **CHAP authentication** - Secure iSCSI connections
 - **ZFS compression** - LZ4, ZSTD, GZIP, and other algorithms
 - **ZFS encryption** - Dataset-level encryption with key management
 - **Automatic snapshot scheduling** - Periodic snapshots via StorageClass
 - **TrueNAS Websocket API** - Uses the modern TrueNAS Websocket API
 - **Prometheus metrics** - Optional `/metrics` endpoint for CSI operations and TrueNAS API health ([docs](docs/metrics.md))
+- **Private CA trust** - Verify a TrueNAS certificate issued by your own CA ([docs](docs/tls.md))
+- **Outbound proxy** - Reach the TrueNAS API through an HTTP proxy ([docs](docs/proxy.md))
 
 ## Requirements
 
@@ -169,6 +171,21 @@ With Helm they are set through values instead; see the
 | `iscsiIQNBase` | Base IQN for iSCSI targets | `iqn.2024-01.com.example` |
 | `metricsAddr` | Prometheus metrics address for the controller (optional; disabled when absent) | `:8080` |
 | `nodeMetricsAddr` | Prometheus metrics address for the node plugin, which uses hostNetwork (optional) | `:8080` |
+| `httpsProxy`, `httpProxy`, `noProxy` | Outbound proxy for the TrueNAS API (optional); see [Outbound Proxy](docs/proxy.md) | `http://proxy.example:3128` |
+
+The pods read these settings, and the API key from the Secret, only when they
+start. After editing either one, restart both workloads to apply the change:
+
+```bash
+kubectl -n truenas-csi rollout restart deployment/truenas-csi-controller
+kubectl -n truenas-csi rollout restart daemonset/truenas-csi-node
+```
+
+The Helm chart and the OpenShift operator do this for you: changing a setting or
+the API key rolls the pods.
+
+For a TrueNAS certificate issued by a private CA, see
+[TLS and Private CAs](docs/tls.md) rather than setting `truenasInsecure`.
 
 ### StorageClass Parameters
 
@@ -224,8 +241,8 @@ provide. Options:
 | `iscsi.initiators` | Allowed initiator IQNs | comma-separated |
 | `iscsi.chapUser` | CHAP username | string |
 | `iscsi.chapSecret` | CHAP password (12-16 chars) | string |
-| `iscsi.chapPeerUser` | Mutual CHAP peer user | string |
-| `iscsi.chapPeerSecret` | Mutual CHAP peer password | string |
+| `iscsi.chapPeerUser` | Mutual CHAP: the user the target authenticates as in return. Requires `iscsi.chapUser` | string |
+| `iscsi.chapPeerSecret` | Mutual CHAP peer password (12-16 chars, different from `iscsi.chapSecret`) | string |
 | `iscsi.multipathEnabled` | Enable multipath for the session (node-side); default `false` | `true`, `false` |
 | `iscsi.persistentSessions` | Keep the iSCSI session persistent (node-side); default `false` | `true`, `false` |
 
@@ -233,6 +250,14 @@ provide. Options:
 > IPv6 portal addresses, so iSCSI staging fails on IPv6-only clusters — use NFS
 > there. The driver fails fast with a clear error if an IPv6 iSCSI portal is
 > configured.
+
+> **CHAP:** each volume gets its own auth group on TrueNAS, which is removed with
+> the volume. The driver never turns on discovery authentication, and nodes log in
+> without SendTargets discovery, so discovery authentication configured on the
+> appliance (Shares > iSCSI > Authorized Access) does not affect volumes. Without
+> it, any initiator that can reach the portal can list the target names, though it
+> cannot log in to a target that requires CHAP. To stop that, turn discovery
+> authentication on there; it applies to every initiator using the appliance.
 
 #### NVMe-oF Parameters
 

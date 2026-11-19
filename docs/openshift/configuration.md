@@ -64,10 +64,35 @@ spec:
 | `iscsiPortal` | string | No | - | iSCSI portal (IP:port) |
 | `iscsiIQNBase` | string | No | `iqn.2005-10.org.freenas.ctl` | Base IQN for targets |
 | `insecureSkipTLS` | bool | No | `false` | Skip TLS verification |
+| `trustedCA` | object | No | - | ConfigMap `name` and `key` (default `ca-bundle.crt`) holding CA certificates to trust; see [TLS Configuration](#tls-configuration) |
+| `useClusterProxy` | bool | No | `false` | Reach the TrueNAS API through the cluster-wide proxy; see [Outbound Proxy](../proxy.md) |
 | `driverImage` | string | No | Operator default | Custom driver image |
 | `controllerReplicas` | int32 | No | `1` | Controller pod replicas |
 | `nodeSelector` | map | No | - | Node selector labels |
 | `tolerations` | array | No | - | Pod tolerations |
+| `managementState` | string | No | `Managed` | `Managed`, `Unmanaged` or `Removed`; see below |
+
+Editing the TrueNASCSI resource, or rotating the API key in its credentials
+Secret, rolls the controller and node pods so they pick up the change. The
+operator tracks the settings the pods read through a hash on their templates, so
+re-applying an unchanged resource restarts nothing.
+
+### Management State
+
+- **Managed**: the operator deploys the driver and keeps it as declared. Every
+  object it creates is owned by the TrueNASCSI resource, so an object that is
+  deleted or edited is put back right away. The namespace and your credentials
+  Secret are not owned, and a CSIDriver object that already exists keeps its spec.
+- **Unmanaged**: the operator leaves the deployed objects alone, so they can be
+  changed by hand. Deleting the resource still removes the driver.
+- **Removed**: the operator deletes the driver but keeps the resource, and
+  switching back to `Managed` deploys it again. Volumes already mounted stay
+  mounted, but nothing can be provisioned, attached, mounted or unmounted while the
+  driver is removed.
+
+Only one TrueNASCSI resource can run the driver. A second one reports `Failed`
+with an error naming the resource that owns it, and deleting the second one
+leaves the first one's driver running.
 
 ### Status Fields
 
@@ -75,7 +100,7 @@ The operator updates the status subresource with deployment information:
 
 ```yaml
 status:
-  phase: Running          # Current phase: Pending, Running, Failed
+  phase: Running          # Current phase: Pending, Running, Failed, Removed
   controllerReady: true   # Controller deployment ready
   nodeDaemonSetReady: true # Node DaemonSet ready
   conditions:
@@ -235,8 +260,16 @@ Ensure the following connectivity between OpenShift nodes and TrueNAS:
 
 For production environments, use valid TLS certificates:
 
-1. **TrueNAS with valid certificate**: Set `insecureSkipTLS: false`
-2. **TrueNAS with self-signed certificate**: Set `insecureSkipTLS: true` (not recommended for production)
+1. **TrueNAS with a certificate from a public CA**: Set `insecureSkipTLS: false`
+2. **TrueNAS with a certificate from a private CA**: Set `insecureSkipTLS: false`
+   and point `trustedCA` at a ConfigMap holding that CA, as below
+3. **TrueNAS with its self-signed certificate**: Set `insecureSkipTLS: true` (not recommended for production)
+
+The certificate must be issued for the host in `truenasURL`, whatever CA signed
+it. To trust every CA the cluster trusts, point `trustedCA` at a ConfigMap
+labeled `config.openshift.io/inject-trusted-cabundle: "true"`, which OpenShift
+fills for you. See [TLS and Private CAs](../tls.md) for the details and for what
+a certificate error at startup means.
 
 ## Resource Tuning
 

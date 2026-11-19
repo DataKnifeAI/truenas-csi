@@ -68,7 +68,7 @@ func TestLoadEnvConfig_ConnectionTuning(t *testing.T) {
 			check: func(t *testing.T, c *driver.DriverConfig) {
 				if c.PingInterval != 20*time.Second || c.PingTimeout != 45*time.Second ||
 					c.DialTimeout != time.Minute || c.PingFailureThreshold != 3 {
-					t.Errorf("unexpected config %+v", c)
+					t.Fatalf("unexpected config %+v", c)
 				}
 			},
 		},
@@ -99,5 +99,20 @@ func TestLoadEnvConfig_ConnectionTuning(t *testing.T) {
 			}
 			tt.check(t, config)
 		})
+	}
+}
+
+func TestLoadEnvConfig_CABundle(t *testing.T) {
+	t.Setenv("TRUENAS_URL", "wss://truenas.example")
+	t.Setenv("TRUENAS_API_KEY", "key")
+	t.Setenv("TRUENAS_DEFAULT_POOL", "tank")
+	t.Setenv(envCABundle, "/etc/truenas-csi/trusted-ca/ca-bundle.crt")
+
+	config := &driver.DriverConfig{}
+	if err := loadEnvConfig(config); err != nil {
+		t.Fatalf("loadEnvConfig() = %v, want nil", err)
+	}
+	if config.TrueNASCABundle != "/etc/truenas-csi/trusted-ca/ca-bundle.crt" {
+		t.Errorf("TrueNASCABundle = %q, want the path from %s", config.TrueNASCABundle, envCABundle)
 	}
 }

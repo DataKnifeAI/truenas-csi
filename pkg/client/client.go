@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,6 +102,10 @@ type Config struct {
 	Logger logr.Logger
 	// CallObserver is notified after every API call completes. Optional.
 	CallObserver CallObserver
+	// Proxy picks the HTTP proxy for connections to TrueNAS, as http.Transport's
+	// Proxy does. Nil means the standard HTTP_PROXY, HTTPS_PROXY and NO_PROXY
+	// environment variables.
+	Proxy func(*http.Request) (*url.URL, error)
 }
 
 // CallObserver reports a finished API call: the JSON-RPC method, how long the
@@ -271,6 +276,10 @@ type Client struct {
 	// apiVersionPinned ensures the API version is resolved/verified only once.
 	apiVersionPinned atomic.Bool
 
+	// supportedVersions is the list /api/versions advertised at preflight, e.g.
+	// ["v25.10.0","v27.0.0"]. Nil when the preflight fetch failed.
+	supportedVersions []string
+
 	// Concurrency limiter for WebSocket calls
 	callSem *semaphore.Weighted
 }
@@ -304,6 +313,9 @@ func New(cfg Config) *Client {
 	}
 	if cfg.TLSConfig == nil && cfg.InsecureSkipVerify {
 		cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	if cfg.Proxy == nil {
+		cfg.Proxy = http.ProxyFromEnvironment
 	}
 
 	if cfg.MaxConcurrentCalls == 0 {
@@ -356,6 +368,13 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	// A certificate that fails verification fails the same way on every retry, so
+	// the first connection gives up at once instead of waiting forever. Once
+	// connected, reconnects keep retrying, so a running driver never exits over it.
+	if IsCertificateError(err) {
+		return fmt.Errorf("%w: %w", ErrCertificateVerification, err)
+	}
+
 	// Only retry on transient connection errors (e.g., TrueNAS unreachable during reboot).
 	// Authentication failures and other errors are returned immediately.
 	if !IsConnectionError(err) {
@@ -383,11 +402,12 @@ func (c *Client) dial(ctx context.Context) error {
 		defer cancel()
 	}
 
-	c.log.Info("Connecting to TrueNAS", "url", c.config.URL, "timeout", c.config.DialTimeout)
+	c.log.Info("Connecting to TrueNAS", "url", c.config.URL, "proxy", c.proxyFor(c.config.URL), "timeout", c.config.DialTimeout)
 
 	conn, _, err := websocket.Dial(ctx, c.config.URL, &websocket.DialOptions{
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
+				Proxy:               c.config.Proxy,
 				TLSClientConfig:     c.config.TLSConfig,
 				TLSHandshakeTimeout: defaultTLSHandshakeTimeout,
 			},
@@ -671,6 +691,27 @@ func jitter(d time.Duration) time.Duration {
 		return d
 	}
 	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+}
+
+// proxyFor returns the proxy a connection to rawURL goes through, with any
+// credentials in it redacted, or "direct" when it goes through none.
+func (c *Client) proxyFor(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	// The WebSocket handshake is an HTTP request, proxied by its HTTP scheme.
+	switch u.Scheme {
+	case "wss":
+		u.Scheme = "https"
+	case "ws":
+		u.Scheme = "http"
+	}
+	proxy, err := c.config.Proxy(&http.Request{URL: u})
+	if err != nil || proxy == nil {
+		return "direct"
+	}
+	return proxy.Redacted()
 }
 
 // Connected reports whether the client has an active connection.

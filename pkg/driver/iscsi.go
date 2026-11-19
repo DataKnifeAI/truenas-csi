@@ -28,9 +28,11 @@ const (
 	paramMultipathEnabled   = "iscsi.multipathEnabled"
 	paramPersistentSessions = "iscsi.persistentSessions"
 
-	// iSCSI connection settings
-	iscsiRetryCount    = 10 // number of login attempts
-	iscsiCheckInterval = 1  // seconds between retries
+	// How long csi-lib-iscsi waits for the device to appear once logged in:
+	// iscsiRetryCount checks, iscsiCheckInterval seconds apart. The login itself
+	// is bounded separately; see iscsiLoginTimeout.
+	iscsiRetryCount    = 10
+	iscsiCheckInterval = 1
 
 	// iscsiadmExitNoObjsFound is iscsiadm's ISCSI_ERR_NO_OBJS_FOUND: the record or
 	// session asked about does not exist.
@@ -141,19 +143,28 @@ func (h *ISCSIHandler) buildConnector(volumeID string, config *ISCSIConfig) *isc
 		Lun:           config.LUN,
 		RetryCount:    iscsiRetryCount,
 		CheckInterval: iscsiCheckInterval,
-		DoDiscovery:   true,
+		// No SendTargets discovery: the publish context already names the target
+		// and portal, and discovery fails outright on an appliance that requires
+		// discovery authentication, which TrueNAS enables for every initiator as
+		// soon as any auth entry asks for it.
+		DoDiscovery: false,
+		// Despite the name, this is csi-lib-iscsi's only path that creates the node
+		// record, and the only one that writes session CHAP credentials to it
+		// before logging in. Discovery secrets stay empty, so nothing is written
+		// for discovery.
+		DoCHAPDiscovery: true,
 	}
 
-	// Configure CHAP authentication
 	if config.CHAPUsername != "" && config.CHAPPassword != "" {
 		connector.AuthType = iscsiAuthTypeCHAP
-		connector.DiscoverySecrets = iscsilib.Secrets{
-			UserName:   config.CHAPUsername,
-			Password:   config.CHAPPassword,
+		connector.SessionSecrets = iscsilib.Secrets{
+			SecretsType: iscsiAuthTypeCHAP,
+			UserName:    config.CHAPUsername,
+			Password:    config.CHAPPassword,
+			// Mutual CHAP: the credentials the target must present in return.
 			UserNameIn: config.CHAPUsernameIn,
 			PasswordIn: config.CHAPPasswordIn,
 		}
-		connector.SessionSecrets = connector.DiscoverySecrets
 	}
 
 	return connector
@@ -191,6 +202,12 @@ func (h *ISCSIHandler) Stage(ctx context.Context, req *StageRequest) (*StageResu
 	}
 
 	if err := ensureIPv4Portal(config.TargetPortal); err != nil {
+		return nil, err
+	}
+
+	// Log in with time to finish, before csi-lib-iscsi's fixed 3-second limit
+	// applies; it then finds the session and only waits for the device.
+	if err := h.ensureISCSISession(ctx, config, iscsiLoginTimeout); err != nil {
 		return nil, err
 	}
 

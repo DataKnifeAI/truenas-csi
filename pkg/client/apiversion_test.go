@@ -91,7 +91,7 @@ func TestFetchSupportedAPIVersions(t *testing.T) {
 	want := []string{"v25.04.0", "v25.04.1", "v25.04.2", "v25.10.0"}
 	_, wsURL := newVersionsServer(t, want, http.StatusOK)
 
-	got, err := fetchSupportedAPIVersions(context.Background(), wsURL, nil)
+	got, err := fetchSupportedAPIVersions(context.Background(), wsURL, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestFetchSupportedAPIVersions(t *testing.T) {
 
 func TestFetchSupportedAPIVersions_HTTPError(t *testing.T) {
 	_, wsURL := newVersionsServer(t, nil, http.StatusInternalServerError)
-	if _, err := fetchSupportedAPIVersions(context.Background(), wsURL, nil); err == nil {
+	if _, err := fetchSupportedAPIVersions(context.Background(), wsURL, nil, nil); err == nil {
 		t.Fatal("expected error on HTTP 500")
 	}
 }
@@ -145,4 +145,18 @@ func TestVerifyAndPinAPIVersion(t *testing.T) {
 			t.Errorf("URL not pinned on fallback: %q", c.config.URL)
 		}
 	})
+}
+
+func TestHasAPIVersion(t *testing.T) {
+	c := &Client{}
+	if c.HasAPIVersion("v25.10.0") {
+		t.Error("expected false before preflight")
+	}
+	c.supportedVersions = []string{"v25.10.0", "v27.0.0"}
+	if !c.HasAPIVersion("v27.0.0") {
+		t.Error("expected v27.0.0 to be reported")
+	}
+	if c.HasAPIVersion("v28.0.0") {
+		t.Error("did not expect v28.0.0 to be reported")
+	}
 }

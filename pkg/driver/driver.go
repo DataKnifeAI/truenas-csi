@@ -32,6 +32,14 @@ var errInvalidVolumeID = errors.New("invalid volume ID")
 // DRIVER_VERSION is set at build time via ldflags.
 var DRIVER_VERSION = "dev"
 
+// certificateVerificationHint follows a failed TLS verification of the TrueNAS
+// certificate, naming the setting for each way the driver is deployed.
+const certificateVerificationHint = "The driver does not trust the TrueNAS TLS certificate. Either trust the CA " +
+	"that issued it (TRUENAS_CA_BUNDLE, trustedCA on the TrueNASCSI resource, or truenas.caBundle in the Helm " +
+	"chart) and make sure the certificate is issued for the host in the TrueNAS URL, or, for the self-signed " +
+	"certificate TrueNAS ships with, turn verification off (TRUENAS_INSECURE_SKIP_VERIFY, insecureSkipTLS, or " +
+	"truenas.insecureSkipTLS)."
+
 const (
 	DRIVER_NAME = "csi.truenas.io"
 
@@ -109,13 +117,14 @@ type VolumeInfo struct {
 	NFSPath    string
 	NFSShareID int
 
-	TargetIQN        string
-	TargetPortal     string
-	LUN              int
-	ISCSITargetID    int
-	ISCSIExtentID    int
-	ISCSIAuthID      int // CHAP auth credential ID
-	ISCSIInitiatorID int // Initiator group ID
+	TargetIQN     string
+	TargetPortal  string
+	LUN           int
+	ISCSITargetID int
+	ISCSIExtentID int
+	// ISCSITargetGroups is the target's access control: the auth group tag and
+	// initiator group each portal group references.
+	ISCSITargetGroups []client.ISCSITargetGroup
 
 	// NVMe-oF resource IDs and identifiers
 	NVMeSubNQN        string // generated subsystem NQN (read back from TrueNAS)
@@ -294,6 +303,9 @@ type DriverConfig struct {
 	TrueNASURL      string
 	TrueNASAPIKey   string
 	TrueNASInsecure bool
+	// TrueNASCABundle is a PEM file of CA certificates to trust for the TrueNAS
+	// API in addition to the system's, for a certificate from a private CA.
+	TrueNASCABundle string
 
 	DefaultPool  string
 	NFSServer    string
@@ -392,9 +404,21 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 	// Built before the client so API calls are observed from the first one.
 	metrics := NewMetrics()
 
+	tlsConfig, err := client.NewTLSConfig(config.TrueNASInsecure, config.TrueNASCABundle)
+	if err != nil {
+		return nil, fmt.Errorf("invalid TrueNAS CA bundle: %w", err)
+	}
+	switch {
+	case config.TrueNASInsecure && config.TrueNASCABundle != "":
+		log.Info("TLS verification is disabled, so the CA bundle is not used", "caBundle", config.TrueNASCABundle)
+	case config.TrueNASCABundle != "":
+		log.V(LogLevelInfo).Info("Trusting the CA certificates in the CA bundle for TrueNAS", "caBundle", config.TrueNASCABundle)
+	}
+
 	cfg := client.Config{
 		URL:                  config.TrueNASURL,
 		APIKey:               config.TrueNASAPIKey,
+		TLSConfig:            tlsConfig,
 		InsecureSkipVerify:   config.TrueNASInsecure,
 		PingInterval:         config.PingInterval,
 		PingTimeout:          config.PingTimeout,
@@ -514,6 +538,9 @@ func (d *Driver) initBackend(ctx context.Context) {
 // and verifies the default pool exists.
 func (d *Driver) checkBackend(ctx context.Context) error {
 	if err := d.client.Connect(ctx); err != nil {
+		if errors.Is(err, client.ErrCertificateVerification) {
+			return fmt.Errorf("failed to connect to TrueNAS: %w\n\n%s", err, certificateVerificationHint)
+		}
 		return fmt.Errorf("failed to connect to TrueNAS: %w", err)
 	}
 
@@ -624,6 +651,12 @@ func (d *Driver) Run(ctx context.Context) error {
 	csi.RegisterIdentityServer(d.server, d.identityServer)
 	csi.RegisterControllerServer(d.server, d.controllerServer)
 	csi.RegisterNodeServer(d.server, d.nodeServer)
+
+	// Only the controller makes clone snapshots, so only it cleans up the ones
+	// earlier versions left. In the background, so volumes are served meanwhile.
+	if controller, ok := d.controllerServer.(*ControllerServer); ok {
+		go controller.sweepCloneSnapshots(ctx)
+	}
 
 	// Metrics are optional and must never keep the driver from serving volumes, so
 	// a listener that cannot be opened is reported and left behind.
@@ -970,12 +1003,13 @@ func (d *Driver) ISCSIPortalID(ctx context.Context) (int, error) {
 		portalHost = d.iscsiPortal
 	}
 
-	portal, err := d.client.GetISCSIPortalByAddress(ctx, portalHost)
+	addresses := portalAddresses(ctx, portalHost)
+	portal, err := d.client.GetISCSIPortalByAddress(ctx, addresses...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query iSCSI portals: %w", err)
 	}
 	if portal == nil {
-		return 0, fmt.Errorf("no iSCSI portal found matching address %q — create one in TrueNAS UI (Shares → iSCSI → Portals)", portalHost)
+		return 0, fmt.Errorf("no iSCSI portal listens on %s; create one in the TrueNAS UI (Shares > iSCSI > Portals)", strings.Join(addresses, ", "))
 	}
 
 	d.cacheMu.Lock()
@@ -1274,12 +1308,19 @@ func (d *Driver) reconstructVolumeFromTrueNAS(ctx context.Context, volumeID stri
 				volInfo.LUN = assoc.LunID
 				if target, err := d.client.GetISCSITargetByID(ctx, assoc.Target); err == nil && target != nil {
 					volInfo.ISCSITargetID = target.ID
+					volInfo.ISCSITargetGroups = target.Groups
 					volInfo.TargetIQN = d.ResolveISCSIIQNBase(ctx, nil) + ":" + target.Name
 					volInfo.TargetPortal = d.iscsiPortal
 					volInfo.VolumeContext[PublishContextTargetPortal] = d.iscsiPortal
 					volInfo.VolumeContext[PublishContextTargetIQN] = volInfo.TargetIQN
 					volInfo.VolumeContext[PublishContextLUN] = fmt.Sprintf("%d", volInfo.LUN)
 				}
+			} else if target, err := d.client.GetISCSITargetByName(ctx, makeISCSITargetSuffix(volumeID)); err == nil {
+				// An interrupted CreateVolume can leave the target without its
+				// association. Find it by name so deleting the volume removes it,
+				// and the auth and initiator groups it references, too.
+				volInfo.ISCSITargetID = target.ID
+				volInfo.ISCSITargetGroups = target.Groups
 			}
 			d.log.V(LogLevelDebug).Info("Reconstructed iSCSI volume", "volumeId", volumeID, "capacityBytes", volInfo.CapacityBytes,
 				"targetIQN", volInfo.TargetIQN, "lun", volInfo.LUN)
